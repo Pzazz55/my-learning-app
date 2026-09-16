@@ -1,0 +1,85 @@
+[
+  {
+    "name": "Google Gemini 2.0 Flash (free tier)",
+    "provider": "google",
+    "model": "gemini-2.0-flash",
+    "api_key_env": "GOOGLE_API_KEY",
+    "free_tier": true,
+    "enabled": false,
+    "status": "Provider quota returned 429"
+  },
+  {
+    "name": "Google Gemini 2.5 Flash (free tier)",
+    "provider": "google",
+    "model": "gemini-2.5-flash",
+    "api_key_env": "GOOGLE_API_KEY",
+    "free_tier": true,
+    "enabled": false,
+    "status": "Provider quota returned 429"
+  },
+  {
+    "name": "Groq GPT OSS 20B (free tier)",
+    "provider": "groq",
+    "model": "openai/gpt-oss-20b",
+    "api_key_env": "GROQ_API_KEY",
+    "free_tier": true,
+    "enabled": true
+  },
+  {
+    "name": "Groq Qwen 3.8 27B (free tier)",
+    "provider": "groq",
+    "model": "qwen/qwen3.8-27b",
+    "api_key_env": "GROQ_API_KEY",
+    "free_tier": true,
+    "enabled": true
+  },
+  {
+    "name": "OpenRouter Gemma 4 26B (free)",
+    "provider": "openrouter",
+    "model": "google/gemma-4-26b-a4b-it:free",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "free_tier": true,
+    "enabled": true
+  },
+  {
+    "name": "OpenRouter Nex N2.5 Mini (free)",
+    "provider": "openrouter",
+    "model": "nex-agi/nex-n2.5-mini:free",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "free_tier": true,
+    "enabled": true
+  },
+  {
+    "name": "OpenRouter Ling 3 Flash (free)",
+    "provider": "openrouter",
+    "model": "inclusionai/ling-3.0-flash-vl:free",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "free_tier": true,
+    "enabled": true
+  },
+  {
+    "name": "OpenRouter Liquid LFM 2.5 (free)",
+    "provider": "openrouter",
+    "model": "liquid/lfm-2.5-2.6b:free",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "free_tier": true,
+    "enabled": true
+  },
+  {
+    "name": "OpenAI GPT-4o mini",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "api_key_env": "OPENAI_API_KEY",
+    "free_tier": false,
+    "enabled": false,
+    "status": "Provider quota returned 429"
+  },
+  {
+    "name": "Hugging Face FLAN-T5 Base",
+    "provider": "huggingface",
+    "model": "google/flan-t5-base",
+    "api_key_env": "HF_TOKEN",
+    "free_tier": true,
+    "enabled": true
+  }
+]

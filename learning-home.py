@@ -2,21 +2,17 @@ from __future__ import annotations
 
 import json
 import random
-import sqlite3
 import time
 from datetime import datetime, timezone
 from html import escape
-from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+
+import storage
 from llm_backend import DEFAULT_SUBJECTS, describe_topic_source, generate_questions as generate_questions_from_backend, load_config, load_grades, load_locations, load_models, load_topics, resolve_subjects, resolve_topics
 
-BASE_DIR = Path(__file__).parent
-load_dotenv(BASE_DIR / ".env")
-DB_PATH = BASE_DIR / "education_app.db"
 TOPICS = load_topics()
 CONFIG = load_config()
 DEFAULTS = CONFIG["defaults"]
@@ -124,48 +120,25 @@ def inject_styles(theme: str) -> None:
     )
 
 
-def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute(
-        """CREATE TABLE IF NOT EXISTS exams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, student_name TEXT NOT NULL, grade TEXT NOT NULL,
-            country TEXT NOT NULL, subject TEXT NOT NULL, question_count INTEGER NOT NULL,
-            time_limit INTEGER NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
-            score INTEGER NOT NULL, correct_count INTEGER NOT NULL, wrong_count INTEGER NOT NULL,
-            questions_json TEXT NOT NULL
-        )"""
-    )
-    connection.execute(
-        """CREATE TABLE IF NOT EXISTS question_sets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, student_name TEXT NOT NULL, grade TEXT NOT NULL,
-            subject TEXT NOT NULL, topic TEXT NOT NULL, questions_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )"""
-    )
-    columns = {row["name"] for row in connection.execute("PRAGMA table_info(exams)")}
-    if "school_district" not in columns:
-        connection.execute("ALTER TABLE exams ADD COLUMN school_district TEXT NOT NULL DEFAULT ''")
-    if "school_state" not in columns:
-        connection.execute("ALTER TABLE exams ADD COLUMN school_state TEXT NOT NULL DEFAULT ''")
-    if "topic" not in columns:
-        connection.execute("ALTER TABLE exams ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
-    if "question_set_id" not in columns:
-        connection.execute("ALTER TABLE exams ADD COLUMN question_set_id INTEGER")
-    connection.commit()
-    return connection
-
-
 def save_question_set(student_name: str, grade: str, subject: str, topic: str, questions: list[dict[str, Any]]) -> int:
-    connection = db()
-    cursor = connection.execute(
-        "INSERT INTO question_sets (student_name, grade, subject, topic, questions_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (student_name, grade, subject, topic, json.dumps(questions), datetime.now(timezone.utc).isoformat()),
+    """Store a generated question set and return its id.
+
+    ``RETURNING id`` reads the new row's key on SQLite and on PostgreSQL alike.
+    """
+    question_set_id = storage.execute(
+        "INSERT INTO question_sets (student_name, grade, subject, topic, questions_json, created_at)"
+        " VALUES (:student_name, :grade, :subject, :topic, :questions_json, :created_at)"
+        " RETURNING id",
+        {
+            "student_name": student_name,
+            "grade": grade,
+            "subject": subject,
+            "topic": topic,
+            "questions_json": json.dumps(questions),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
-    connection.commit()
-    question_set_id = int(cursor.lastrowid)
-    connection.close()
-    return question_set_id
+    return int(question_set_id or 0)
 
 
 def attach_visuals(questions: list[dict[str, Any]], subject: str, topic: str, enabled: bool) -> list[dict[str, Any]]:
@@ -224,6 +197,10 @@ def render_clock() -> None:
 
 
 def submit_exam() -> None:
+    # Prevent multiple submissions
+    if st.session_state.get("exam_submitted"):
+        return
+    
     record_current_question_time()
     exam = st.session_state.exam
     answers = st.session_state.answers
@@ -236,10 +213,11 @@ def submit_exam() -> None:
         "wrong_count": len(exam["questions"]) - correct,
         "questions_json": json.dumps([{**question, "student_answer": answers.get(index), "time_seconds": round(st.session_state.question_times.get(index, 0.0), 1)} for index, question in enumerate(exam["questions"])]),
     }
-    connection = db()
-    connection.execute("INSERT INTO exams (student_name, grade, country, school_state, school_district, subject, topic, question_set_id, question_count, time_limit, start_time, end_time, score, correct_count, wrong_count, questions_json) VALUES (:student_name, :grade, :country, :school_state, :school_district, :subject, :topic, :question_set_id, :question_count, :time_limit, :start_time, :end_time, :score, :correct_count, :wrong_count, :questions_json)", record)
-    connection.commit()
-    connection.close()
+    storage.execute(
+        "INSERT INTO exams (student_name, grade, country, school_state, school_district, subject, topic, question_set_id, question_count, time_limit, start_time, end_time, score, correct_count, wrong_count, questions_json)"
+        " VALUES (:student_name, :grade, :country, :school_state, :school_district, :subject, :topic, :question_set_id, :question_count, :time_limit, :start_time, :end_time, :score, :correct_count, :wrong_count, :questions_json)",
+        record,
+    )
     st.session_state.result = record
     st.session_state.exam_submitted = True
 
@@ -353,7 +331,7 @@ def show_setup() -> None:
             return
         with st.spinner("Preparing your questions..."):
             try:
-                questions, source = generate_questions_from_backend(DB_PATH, selected_model, subject, grade, count, school_state, school_district, topic_value, name.strip(), temperature, include_images)
+                questions, source = generate_questions_from_backend(selected_model, subject, grade, count, school_state, school_district, topic_value, name.strip(), temperature, include_images)
             except RuntimeError as error:
                 st.error(str(error))
                 return
@@ -442,7 +420,8 @@ def show_exam() -> None:
         st.session_state.current_question += 1
         st.session_state.question_started_at = time.time()
         st.rerun()
-    if not exam.get("practice_mode") and current == len(exam["questions"]) - 1 and right.button("Submit exam", type="primary", use_container_width=True):
+    # Only show submit button if exam is not already submitted
+    if not exam.get("practice_mode") and current == len(exam["questions"]) - 1 and not st.session_state.get("exam_submitted") and right.button("Submit exam", type="primary", use_container_width=True):
         record_current_question_time()
         st.session_state.answers[current] = selected
         submit_exam()
@@ -463,8 +442,11 @@ temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, val
 st.sidebar.caption("Enable or disable models in config/models.json.")
 st.sidebar.caption(f"Clock: {CONFIG['timezone']} ({CONFIG['timezone_label']}) from config/config.json.")
 st.sidebar.caption("Field defaults come from config/config.json; subjects and topics from config/topics.json.")
+storage.ensure_schema()
+st.sidebar.caption(f"Results storage: {storage.backend_label()}.")
+if not storage.is_hosted():
+    st.sidebar.info("Results are stored in a local file that a hosted container may discard. Set DATABASE_URL to a PostgreSQL URL to keep them permanently.")
 inject_styles(theme)
-db().close()
 if "exam" not in st.session_state:
     show_setup()
 else:

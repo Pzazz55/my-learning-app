@@ -29,7 +29,19 @@ The app uses SQLite in `education_app.db`, created automatically on first run. O
 
 There is no build step: Community Cloud installs `requirements.txt` and runs the main file straight from GitHub.
 
-1. Push the repository to GitHub.
+1. Push the repository to GitHub. With the GitHub CLI:
+
+   ```powershell
+   gh repo create my-learning-app --public --source . --remote origin --push
+   ```
+
+   Or, after creating an empty repository on github.com:
+
+   ```powershell
+   git remote add origin https://github.com/<your-account>/my-learning-app.git
+   git push -u origin master
+   ```
+
 2. Open <https://share.streamlit.io> and click **Create app** → **Yup, I have an app**.
 3. Fill in the app details:
 

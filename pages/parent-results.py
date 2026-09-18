@@ -3,16 +3,18 @@ from __future__ import annotations
 import json
 import hmac
 from html import escape
-import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 import streamlit as st
+from llm_backend import load_config, load_grades, load_topics, read_setting
 
 DB_PATH = Path(__file__).parent.parent / "education_app.db"
 load_dotenv(DB_PATH.parent / ".env")
+SUBJECT_CATALOG = list(load_topics()["subjects"])
+CONFIG = load_config()
 
 
 def format_question_time(seconds: float) -> str:
@@ -27,6 +29,24 @@ def format_exam_duration(start_time: str, end_time: str) -> str:
     except (TypeError, ValueError):
         return "Unavailable"
     return format_question_time(seconds)
+
+
+def format_local_time(value: str) -> str:
+    """Render a stored UTC timestamp in the timezone configured in config.json."""
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return "Unavailable"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(CONFIG["zone"]).strftime("%d %b %Y, %H:%M %Z")
+
+
+def format_options(options: list[str] | None) -> str:
+    """List a question's answer options one per line so parents can review them."""
+    if not options:
+        return "—"
+    return "<br>".join(f"{letter}) {escape(str(option))}" for letter, option in zip("ABCDEFGH", options))
 
 st.set_page_config(page_title="Parent Results · Study Sprint", page_icon="▦", layout="wide")
 theme = st.sidebar.radio("Appearance", ["Light", "Dark"], index=1, horizontal=True, key="appearance")
@@ -90,15 +110,11 @@ st.markdown(
 
 st.markdown('<div class="brand">study<span>·</span>sprint / parent view</div>', unsafe_allow_html=True)
 
-try:
-    expected_username = st.secrets.get("parent_username") or os.getenv("PARENT_USERNAME")
-    expected_password = st.secrets.get("parent_password") or os.getenv("PARENT_PASSWORD")
-except Exception:
-    expected_username = os.getenv("PARENT_USERNAME")
-    expected_password = os.getenv("PARENT_PASSWORD")
+expected_username = read_setting("PARENT_USERNAME")
+expected_password = read_setting("PARENT_PASSWORD")
 
 if not expected_username or not expected_password:
-    st.error("Parent credentials are not configured. Add them to .streamlit/secrets.toml or set PARENT_USERNAME and PARENT_PASSWORD.")
+    st.error("Parent credentials are not configured. Set PARENT_USERNAME and PARENT_PASSWORD in .streamlit/secrets.toml, Streamlit Cloud secrets, or .env.")
     st.stop()
 
 if not st.session_state.get("parent_authenticated", False):
@@ -131,6 +147,11 @@ if not DB_PATH.exists():
 connection = sqlite3.connect(DB_PATH)
 connection.row_factory = sqlite3.Row
 columns = {row["name"] for row in connection.execute("PRAGMA table_info(exams)")}
+if not columns:
+    # The database file exists but no exam has ever been stored yet.
+    connection.close()
+    st.info("No exam results yet. Completed exams will appear here.")
+    st.stop()
 if "school_district" not in columns:
     connection.execute("ALTER TABLE exams ADD COLUMN school_district TEXT NOT NULL DEFAULT ''")
 if "school_state" not in columns:
@@ -143,23 +164,26 @@ connection.close()
 
 with st.container(border=True):
     st.markdown("#### Filter results")
-    first, second, third = st.columns(3)
+    first, second, third, fourth = st.columns(4)
     name_filter = first.text_input("Student name", placeholder="Search by name")
-    grade_filter = second.selectbox("Grade", ["All grades"] + [f"Grade {number}" for number in range(1, 13)])
-    subject_filter = third.selectbox("Subject", ["All subjects", "Maths", "English", "Science", "General Knowledge", "Others"])
+    grades_list = load_grades(load_topics(), CONFIG)
+    grade_filter = second.selectbox("Grade", ["All grades"] + grades_list)
+    subject_filter = third.selectbox("Subject", ["All subjects"] + SUBJECT_CATALOG)
+    topic_source = [row for row in rows if (not name_filter or name_filter.lower() in row["student_name"].lower()) and (grade_filter == "All grades" or row["grade"] == grade_filter) and (subject_filter == "All subjects" or row["subject"] == subject_filter)]
+    topic_filter = fourth.selectbox("Topic", ["All topics"] + sorted({row["topic"] for row in topic_source if row["topic"]}))
 
-filtered = [row for row in rows if (not name_filter or name_filter.lower() in row["student_name"].lower()) and (grade_filter == "All grades" or row["grade"] == grade_filter) and (subject_filter == "All subjects" or row["subject"] == subject_filter)]
+filtered = [row for row in topic_source if topic_filter == "All topics" or row["topic"] == topic_filter]
 
 if not filtered:
     st.info("No results match these filters.")
 else:
     st.markdown(f"**{len(filtered)} result(s)**")
     for row in filtered:
-        ended = datetime.fromisoformat(row["end_time"]).strftime("%d %b %Y, %H:%M")
+        ended = format_local_time(row["end_time"])
         overall_time = format_exam_duration(row["start_time"], row["end_time"])
         with st.expander(f"{row['student_name']} · {row['subject']} · {row['score']}% · {ended}"):
-            metrics = st.columns(6)
-            metrics[0].metric("Grade", row["grade"])
+            metrics = st.columns([1.3, 1, 1, 1, 1, 1.3])
+            metrics[0].metric("Grade", str(row["grade"]).removeprefix("Grade ").strip() or str(row["grade"]))
             metrics[1].metric("Score", f"{row['score']}%")
             metrics[2].metric("Correct", row["correct_count"])
             metrics[3].metric("Wrong", row["wrong_count"])
@@ -170,11 +194,11 @@ else:
             st.caption(f"Location: {location}{topic} · Time limit: {row['time_limit']} minutes · Completed: {ended}")
             review = json.loads(row["questions_json"])
             table_rows = "".join(
-                f"<tr><td>{index}</td><td>{escape(str(item['question']))}</td><td>{escape(str(item.get('student_answer') or 'Not answered'))}</td><td>{escape(str(item['answer']))}</td><td>{format_question_time(item.get('time_seconds', 0))}</td><td>{'Correct' if item.get('student_answer') == item['answer'] else 'Wrong'}</td></tr>"
+                f"<tr><td>{index}</td><td>{escape(str(item['question']))}</td><td>{format_options(item.get('options'))}</td><td>{escape(str(item.get('student_answer') or 'Not answered'))}</td><td>{escape(str(item['answer']))}</td><td>{format_question_time(item.get('time_seconds', 0))}</td><td>{'Correct' if item.get('student_answer') == item['answer'] else 'Wrong'}</td></tr>"
                 for index, item in enumerate(review, 1)
             )
             st.markdown(
-                f'<table class="results-table"><thead><tr><th>#</th><th>Question</th><th>Student answer</th><th>Correct answer</th><th>Time</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table>',
+                f'<table class="results-table"><thead><tr><th>#</th><th>Question</th><th>Options</th><th>Student answer</th><th>Correct answer</th><th>Time</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table>',
                 unsafe_allow_html=True,
             )
             confirm_delete = st.checkbox("Confirm deletion", key=f"confirm_delete_{row['id']}")

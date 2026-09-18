@@ -4,3 +4,9 @@ __pycache__/
 .env
 education_app.db
 .streamlit/secrets.toml
+.vscode/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+*.log

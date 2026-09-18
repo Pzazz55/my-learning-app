@@ -5,44 +5,27 @@ import random
 import sqlite3
 import time
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-from llm_backend import generate_questions as generate_questions_from_backend, load_models
+from llm_backend import DEFAULT_SUBJECTS, describe_topic_source, generate_questions as generate_questions_from_backend, load_config, load_grades, load_locations, load_models, load_topics, resolve_subjects, resolve_topics
 
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
 DB_PATH = BASE_DIR / "education_app.db"
-SUBJECTS = ["Maths", "English", "Science", "General Knowledge", "Others"]
+TOPICS = load_topics()
+CONFIG = load_config()
+DEFAULTS = CONFIG["defaults"]
+LOCATIONS = load_locations()
+COUNTRIES = list(LOCATIONS.keys())
+GRADE_OPTIONS = load_grades(TOPICS, CONFIG)
 QUESTION_COUNTS = [5, 10, 15, 20, 25, 30]
-COUNTRIES = ["United Kingdom", "United States", "Canada", "Australia", "India", "Other"]
-US_STATES = [
-    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", "Delaware", "Florida", "Georgia",
-    "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts",
-    "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey",
-    "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
-    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington", "West Virginia",
-    "Wisconsin", "Wyoming", "District of Columbia",
-]
-SCHOOL_DISTRICTS_BY_STATE = {
-    "Alabama": ["Birmingham City Schools"], "Alaska": ["Anchorage School District"], "Arizona": ["Phoenix Union High School District", "Tucson Unified School District"],
-    "Arkansas": [], "California": ["Fresno Unified School District", "Los Angeles Unified School District", "San Diego Unified School District", "San Francisco Unified School District"],
-    "Colorado": ["Denver Public Schools"], "Connecticut": [], "Delaware": [], "Florida": ["Broward County Public Schools", "Duval County Public Schools", "Miami-Dade County Public Schools", "Orange County Public Schools", "Palm Beach County School District", "Pinellas County Schools"],
-    "Georgia": ["Atlanta Public Schools"], "Hawaii": ["Hawaii Department of Education"], "Idaho": [], "Illinois": ["Chicago Public Schools"],
-    "Indiana": ["Indianapolis Public Schools"], "Iowa": [], "Kansas": ["Wichita Public Schools"], "Kentucky": ["Jefferson County Public Schools"],
-    "Louisiana": [], "Maine": [], "Maryland": ["Baltimore City Public Schools", "Baltimore County Public Schools", "Montgomery County Public Schools", "Prince George's County Public Schools"],
-    "Massachusetts": ["Boston Public Schools"], "Michigan": ["Detroit Public Schools Community District"], "Minnesota": [], "Mississippi": [],
-    "Missouri": ["Kansas City Public Schools", "St. Louis Public Schools"], "Montana": [], "Nebraska": [], "Nevada": ["Clark County School District"],
-    "New Hampshire": [], "New Jersey": ["Newark Public Schools"], "New Mexico": ["Albuquerque Public Schools"], "New York": ["New York City Public Schools"],
-    "North Carolina": ["Charlotte-Mecklenburg Schools", "Wake County Public School System"], "North Dakota": [], "Ohio": ["Cleveland Metropolitan School District", "Columbus City Schools"],
-    "Oklahoma": ["Oklahoma City Public Schools"], "Oregon": ["Portland Public Schools"], "Pennsylvania": ["Philadelphia School District"], "Rhode Island": [],
-    "South Carolina": [], "South Dakota": [], "Tennessee": ["Memphis-Shelby County Schools", "Shelby County Schools"], "Texas": ["Austin Independent School District", "Dallas Independent School District", "Fort Worth Independent School District", "Houston Independent School District", "Northside Independent School District"],
-    "Utah": [], "Vermont": [], "Virginia": ["Arlington Public Schools", "Fairfax County Public Schools", "Prince William County Public Schools", "Richmond Public Schools", "Virginia Beach City Public Schools"],
-    "Washington": ["Seattle Public Schools"], "West Virginia": [], "Wisconsin": ["Milwaukee Public Schools"], "Wyoming": [], "District of Columbia": ["Washington Metropolitan School District"],
-}
+STATE_PLACEHOLDER = "Select a state"
+DISTRICT_PLACEHOLDER = "Select a school district"
 VISUALS_BY_SUBJECT = {
     "Maths": ("https://images.unsplash.com/photo-1509228468518-180dd4864904?auto=format&fit=crop&w=1200&q=80", "Maths visual"),
     "English": ("https://images.unsplash.com/photo-1456513080510-7bf3a84b82f8?auto=format&fit=crop&w=1200&q=80", "Books and reading"),
@@ -66,6 +49,8 @@ def inject_styles(theme: str) -> None:
         .stButton > button:hover, .stFormSubmitButton > button:hover { background:#ff927d; color:#17223a; }
         div[data-testid="stMetric"] { background:#263653; border-color:#f6c94c; }
         div[data-testid="stMetric"] *, div[data-testid="stMetricLabel"], div[data-testid="stMetricValue"] { color:#f6f7ff !important; -webkit-text-fill-color:#f6f7ff !important; }
+        .clock-time { color:#f6f7ff !important; }
+        .clock-zone, .clock-date { color:#c2cbe0 !important; }
         .stRadio label { background:#263653; border-color:#5bbce8; color:#f6f7ff; }
         .stRadio label:hover { border-color:#ff927d; background:#3b3d56; }
         .stSelectbox [data-baseweb="select"], .stTextInput input, .stNumberInput input { background:#263653; color:#f6f7ff; border-color:#5bbce8; }
@@ -114,6 +99,10 @@ def inject_styles(theme: str) -> None:
         div[data-testid="stMetricValue"] { font-size:1.8rem; }
         .timer { font-family:'Space Grotesk'; font-size:2.8rem; font-weight:700; color:#e85d4a; text-align:right; }
         .timer-label { color:var(--muted); font-size:.95rem; text-align:right; }
+        .clock { text-align:right; margin-bottom:.4rem; }
+        .clock-time { font-family:'Space Grotesk'; font-size:1.6rem; font-weight:700; color:#17324d; line-height:1.1; }
+        .clock-zone { color:var(--muted); font-size:.82rem; font-weight:700; letter-spacing:.06em; }
+        .clock-date { color:var(--muted); font-size:.78rem; }
         .question-index { color:#e85d4a; font-size:.95rem; font-weight:700; text-transform:uppercase; letter-spacing:.1em; }
         .question-text { font-family:'Space Grotesk'; font-size:clamp(1.6rem, 3.4vw, 2.35rem); line-height:1.2; margin:.65rem 0 1.8rem; }
         .stRadio > div { gap:.55rem; }
@@ -216,6 +205,24 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m {remaining:02d}s" if minutes else f"{remaining}s"
 
 
+@st.fragment(run_every="1s")
+def render_clock() -> None:
+    """Show the current time in the timezone configured in config.json.
+
+    The clock lives in its own fragment so only the clock redraws each second,
+    and ``%Z`` reports the real abbreviation for the moment shown - EST/EDT for
+    America/New_York, GMT/BST for Europe/London, IST for Asia/Kolkata, and so
+    on, including that zone's daylight saving rules.
+    """
+    now = datetime.now(CONFIG["zone"])
+    st.markdown(
+        f'<div class="clock"><div class="clock-time">{now.strftime("%I:%M:%S %p").lstrip("0")}</div>'
+        f'<div class="clock-zone">{now.strftime("%Z")} · {escape(str(CONFIG["timezone_label"]))}</div>'
+        f'<div class="clock-date">{now.strftime("%a %d %b %Y")}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def submit_exam() -> None:
     record_current_question_time()
     exam = st.session_state.exam
@@ -242,7 +249,10 @@ def show_result() -> None:
     if not st.session_state.get("celebration_shown", False):
         st.balloons()
         st.session_state.celebration_shown = True
-    st.markdown('<div class="eyebrow">Exam complete</div>', unsafe_allow_html=True)
+    brand_left, brand_right = st.columns([3, 1])
+    brand_left.markdown('<div class="eyebrow">Exam complete</div>', unsafe_allow_html=True)
+    with brand_right:
+        render_clock()
     st.markdown('<div class="celebration">🎉 Amazing work! ⭐ You made it to the finish line! 🎈</div>', unsafe_allow_html=True)
     st.title("You did it!")
     st.markdown(f'<div class="success-box"><strong>{result["student_name"]}</strong>, your result has been saved for parent review.</div>', unsafe_allow_html=True)
@@ -262,52 +272,94 @@ def show_result() -> None:
         st.rerun()
 
 
+def option_index(options: list[Any], preferred: Any, fallback: int = 0) -> int:
+    """Index of the configured default value, or a fallback when it is absent."""
+    try:
+        return options.index(preferred)
+    except ValueError:
+        return fallback
+
+
+def whole_number(value: Any, fallback: int) -> int:
+    """Coerce a config value to an int, falling back when it is not a number."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def show_setup() -> None:
-    st.markdown('<div class="brand"><div class="brand-mark">study<span>·</span>sprint</div><div class="pill">Student workspace</div></div>', unsafe_allow_html=True)
+    brand_left, brand_right = st.columns([3, 1])
+    brand_left.markdown('<div class="brand"><div class="brand-mark">study<span>·</span>sprint</div><div class="pill">Student workspace</div></div>', unsafe_allow_html=True)
+    with brand_right:
+        render_clock()
     st.markdown('<div class="hero"><div class="eyebrow">Small steps, sharp thinking</div><h1>Your next best answer starts here.</h1><p>Build confidence with a focused, grade-aware quiz. Your progress is saved automatically so you can review it later.</p></div>', unsafe_allow_html=True)
     st.write("")
-    country = st.selectbox("Country", COUNTRIES, index=COUNTRIES.index("United States"))
-    school_state = st.selectbox("State", ["Select a state"] + US_STATES, index=US_STATES.index("North Carolina") + 1) if country == "United States" else ""
-    districts = SCHOOL_DISTRICTS_BY_STATE.get(school_state, [])
-    subject = st.selectbox("Test type", SUBJECTS)
-    topic = st.text_input("Topic", placeholder="e.g. World War II or Photography") if subject == "Others" else ""
-    include_images = st.toggle("Include visual questions", value=False, help="Adds visuals to about 30% of applicable questions.")
-    practice_mode = st.toggle("Practice mode", value=False, help="Shows the correct answer after each question and moves forward only.")
+    country = st.selectbox("Country", COUNTRIES, index=option_index(COUNTRIES, DEFAULTS["country"]))
+    country_states = LOCATIONS.get(country, {})
+    if country_states:
+        state_names = list(country_states.keys())
+        state_options = [STATE_PLACEHOLDER] + state_names
+        fallback_state = "North Carolina" if "North Carolina" in state_names else (state_names[0] if state_names else "")
+        school_state = st.selectbox("State", state_options, index=option_index(state_options, DEFAULTS["state"], fallback=option_index(state_options, fallback_state)))
+    else:
+        school_state = ""
+
+    districts = country_states.get(school_state, []) if school_state and school_state != STATE_PLACEHOLDER else []
+    if country_states and districts:
+        district_options = [DISTRICT_PLACEHOLDER] + districts
+        school_district = st.selectbox("School District", district_options, index=option_index(district_options, DEFAULTS["school_district"], fallback=1 if districts else 0))
+    elif country_states and school_state and school_state != STATE_PLACEHOLDER:
+        district_options = [DISTRICT_PLACEHOLDER]
+        school_district = st.selectbox("School District", district_options, index=0)
+    else:
+        school_district = ""
+
+    grade = st.selectbox("Grade", GRADE_OPTIONS, index=option_index(GRADE_OPTIONS, DEFAULTS["grade"]))
+    subject_options = resolve_subjects(TOPICS, grade, school_district)
+    subject = st.selectbox("Subject", subject_options, index=option_index(subject_options, DEFAULTS["subject"]))
+    topic_options = resolve_topics(TOPICS, subject, grade, school_district)
+    if topic_options:
+        topic = st.selectbox("Topic", topic_options, index=option_index(topic_options, DEFAULTS.get("topic")), key="topic_select")
+        source_label = describe_topic_source(TOPICS, subject, grade, school_district)
+        st.caption(f"Topics for {source_label} from config/topics.json." if source_label else "Topics from config/topics.json.")
+    else:
+        topic = st.text_input("Topic", placeholder="e.g. World War II or Photography", key="topic_custom")
+    topic_value = (topic or "").strip()
+    include_images = st.toggle("Include visual questions", value=bool(DEFAULTS["include_images"]), help="Adds visuals to about 30% of applicable questions.")
+    practice_mode = st.toggle("Practice mode", value=bool(DEFAULTS["practice_mode"]), help="Shows the correct answer after each question and moves forward only.")
     with st.form("exam_setup"):
         first, second = st.columns(2)
         name = first.text_input("Student name", placeholder="e.g. Alex Morgan")
-        grade = second.selectbox("Grade", [f"Grade {number}" for number in range(1, 13)])
-        district_options = ["Select a school district"] + districts
-        default_district = districts.index("Charlotte-Mecklenburg Schools") + 1 if "Charlotte-Mecklenburg Schools" in districts else 0
-        school_district = first.selectbox("School District", district_options, index=default_district) if country == "United States" else ""
-        count = first.selectbox("Number of questions", QUESTION_COUNTS, index=0)
-        minutes = second.number_input("Time limit (minutes)", min_value=1, max_value=180, value=10, step=1)
+        count = first.selectbox("Number of questions", QUESTION_COUNTS, index=option_index(QUESTION_COUNTS, whole_number(DEFAULTS["question_count"], QUESTION_COUNTS[0])))
+        minutes = second.number_input("Time limit (minutes)", min_value=1, max_value=180, value=min(180, max(1, whole_number(DEFAULTS["time_limit"], 10))), step=1)
         submitted = st.form_submit_button("Start exam →", use_container_width=True)
     if submitted:
         if not name.strip():
             st.error("Please enter a student name to begin.")
             return
-        if country == "United States" and school_state == "Select a state":
-            st.error("Please select a state to begin.")
-            return
-        if country == "United States" and school_district == "Select a school district":
-            st.error("Please select a school district to begin.")
-            return
-        if country == "United States" and not districts:
-            st.error("No district catalog entries are available for this state yet.")
-            return
-        if subject == "Others" and not topic.strip():
-            st.error("Please enter a topic for the custom test type.")
+        if country_states:
+            if school_state == STATE_PLACEHOLDER:
+                st.error("Please select a state to begin.")
+                return
+            if not districts:
+                st.error("No district catalog entries are available for this state yet.")
+                return
+            if school_district == DISTRICT_PLACEHOLDER:
+                st.error("Please select a school district to begin.")
+                return
+        if not topic_value:
+            st.error("Please enter a topic for the custom subject." if subject == "Others" else "Please select a topic to begin.")
             return
         with st.spinner("Preparing your questions..."):
             try:
-                questions, source = generate_questions_from_backend(DB_PATH, selected_model, subject, grade, count, school_state, school_district, topic.strip(), name.strip(), temperature, include_images)
+                questions, source = generate_questions_from_backend(DB_PATH, selected_model, subject, grade, count, school_state, school_district, topic_value, name.strip(), temperature, include_images)
             except RuntimeError as error:
                 st.error(str(error))
                 return
-        questions = attach_visuals(questions, subject, topic.strip(), include_images)
-        question_set_id = save_question_set(name.strip(), grade, subject, topic.strip(), questions)
-        st.session_state.exam = {"student_name": name.strip(), "grade": grade, "country": country, "school_state": school_state, "school_district": school_district, "subject": subject, "topic": topic.strip(), "include_images": include_images, "practice_mode": practice_mode, "question_set_id": question_set_id, "time_limit": int(minutes), "questions": questions, "start_time": datetime.now(timezone.utc).isoformat(), "deadline": time.time() + int(minutes) * 60, "source": source}
+        questions = attach_visuals(questions, subject, topic_value, include_images)
+        question_set_id = save_question_set(name.strip(), grade, subject, topic_value, questions)
+        st.session_state.exam = {"student_name": name.strip(), "grade": grade, "country": country, "school_state": school_state, "school_district": school_district, "subject": subject, "topic": topic_value, "include_images": include_images, "practice_mode": practice_mode, "question_set_id": question_set_id, "time_limit": int(minutes), "questions": questions, "start_time": datetime.now(timezone.utc).isoformat(), "deadline": time.time() + int(minutes) * 60, "source": source}
         st.session_state.answers = {}
         st.session_state.question_times = {}
         st.session_state.question_started_at = None
@@ -338,8 +390,11 @@ def show_exam() -> None:
     question = exam["questions"][current]
     minutes, seconds = divmod(seconds_left, 60)
     top_left, top_right = st.columns([3, 1])
-    top_left.markdown(f'<div class="brand"><div class="brand-mark">study<span>·</span>sprint</div><div class="pill">{exam["student_name"]} · {exam["subject"]}</div></div>', unsafe_allow_html=True)
-    top_right.markdown(f'<div class="timer">{minutes:02d}:{seconds:02d}</div><div class="timer-label">remaining</div>', unsafe_allow_html=True)
+    exam_details = " · ".join(escape(str(value)) for value in (exam["student_name"], exam["grade"], exam["subject"], exam["topic"]) if value)
+    top_left.markdown(f'<div class="brand"><div class="brand-mark">study<span>·</span>sprint</div><div class="pill">{exam_details}</div></div>', unsafe_allow_html=True)
+    with top_right:
+        render_clock()
+        st.markdown(f'<div class="timer">{minutes:02d}:{seconds:02d}</div><div class="timer-label">remaining</div>', unsafe_allow_html=True)
     st.progress((current + 1) / len(exam["questions"]))
     st.markdown(f'<div class="question-panel"><div class="question-index">Question {current + 1} of {len(exam["questions"])}</div><div class="question-text">{question["question"]}</div>', unsafe_allow_html=True)
     if question.get("image_url"):
@@ -395,15 +450,19 @@ def show_exam() -> None:
     st.caption(f"Questions are generated using {exam['source']}.")
 
 
-theme = st.sidebar.radio("Appearance", ["Light", "Dark"], index=1, horizontal=True, key="appearance")
+theme = st.sidebar.radio("Appearance", ["Light", "Dark"], index=option_index(["Light", "Dark"], DEFAULTS["appearance"], fallback=1), horizontal=True, key="appearance")
+for message in CONFIG["warnings"]:
+    st.sidebar.warning(message)
 configured_models = load_models()
 if not configured_models:
-    st.sidebar.error("No enabled models found in models.json.")
+    st.sidebar.error("No enabled models found in config/models.json.")
     st.stop()
-selected_model_name = st.sidebar.selectbox("LLM model", [model["name"] for model in configured_models], index=0, help="Models are configured in models.json.")
+selected_model_name = st.sidebar.selectbox("LLM model", [model["name"] for model in configured_models], index=0, help="Models are configured in config/models.json.")
 selected_model = configured_models[[model["name"] for model in configured_models].index(selected_model_name)]
 temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, value=0.3, step=0.1, help="Lower values are more consistent; higher values create more variety.")
-st.sidebar.caption("Enable or disable models in models.json.")
+st.sidebar.caption("Enable or disable models in config/models.json.")
+st.sidebar.caption(f"Clock: {CONFIG['timezone']} ({CONFIG['timezone_label']}) from config/config.json.")
+st.sidebar.caption("Field defaults come from config/config.json; subjects and topics from config/topics.json.")
 inject_styles(theme)
 db().close()
 if "exam" not in st.session_state:

@@ -5,31 +5,420 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-MODELS_PATH = BASE_DIR / "models.json"
+CONFIG_DIR = BASE_DIR / "config"
+
+
+def _resolve_config_path(filename: str) -> Path:
+    """Return the path to a config file, checking config/ first with root fallback."""
+    in_config_dir = CONFIG_DIR / filename
+    if in_config_dir.exists():
+        return in_config_dir
+    return BASE_DIR / filename
+
+
+MODELS_PATH = _resolve_config_path("models.json")
+TOPICS_PATH = _resolve_config_path("topics.json")
+CONFIG_PATH = _resolve_config_path("config.json")
+LOCATIONS_PATH = _resolve_config_path("locations.json")
+DEFAULT_CONFIG: dict[str, Any] = {
+    "timezone": "America/New_York",
+    "timezone_label": "Eastern Time",
+    "defaults": {
+        "country": "United States",
+        "state": "North Carolina",
+        "school_district": "Charlotte-Mecklenburg Schools",
+        "grade": "Grade 1",
+        "subject": "Maths",
+        "topic": "",
+        "question_count": 5,
+        "time_limit": 10,
+        "include_images": False,
+        "practice_mode": False,
+        "appearance": "Dark",
+    },
+}
 load_dotenv(BASE_DIR / ".env")
 
 
+def read_setting(name: str) -> str | None:
+    """Return a configured value from Streamlit secrets first, then the environment.
+
+    Locally the value comes from ``.env``; on Streamlit Community Cloud the same
+    value is pasted into the app's *Advanced settings -> Secrets* box, which is
+    exposed through ``st.secrets``. Secrets are matched case-insensitively
+    because provider keys are named in upper case (``GROQ_API_KEY``) while the
+    Parent Results credentials were historically written in lower case
+    (``parent_username``). Lookups never raise: a missing or malformed
+    secrets.toml simply means the value is not configured.
+    """
+    if not name:
+        return None
+    for candidate in (name, name.lower()):
+        try:
+            value = st.secrets.get(candidate)
+        except Exception:  # noqa: BLE001 - secrets.toml may be absent or unreadable
+            value = None
+        if value:
+            return str(value)
+    for candidate in (name, name.upper(), name.lower()):
+        value = os.getenv(candidate)
+        if value:
+            return value
+    return None
+
+
 def load_models() -> list[dict[str, Any]]:
-    with MODELS_PATH.open(encoding="utf-8") as file:
+    path = _resolve_config_path("models.json")
+    with path.open(encoding="utf-8") as file:
         models = json.load(file)
     available = []
     for model in models:
         if not model.get("enabled", True):
             continue
         key_name = model.get("api_key_env", "")
-        try:
-            key = st.secrets.get(key_name) or os.getenv(key_name)
-        except Exception:
-            key = os.getenv(key_name)
+        key = read_setting(key_name)
         if key:
             available.append(model)
     return available
+
+
+DEFAULT_LOCATIONS: dict[str, dict[str, list[str]]] = {
+    "United States": {
+        "North Carolina": ["Charlotte-Mecklenburg Schools", "Wake County Public School System"],
+        "California": ["Los Angeles Unified School District", "San Diego Unified School District"],
+    },
+    "Canada": {},
+    "United Kingdom": {},
+    "Australia": {},
+    "India": {},
+    "Other": {},
+}
+
+
+def load_locations() -> dict[str, dict[str, list[str]]]:
+    """Return the Country -> State -> [School Districts] mapping configured in locations.json."""
+    try:
+        path = _resolve_config_path("locations.json")
+        with path.open(encoding="utf-8") as file:
+            configured = json.load(file)
+    except FileNotFoundError:
+        return DEFAULT_LOCATIONS
+
+    if not isinstance(configured, dict):
+        return DEFAULT_LOCATIONS
+
+    locations: dict[str, dict[str, list[str]]] = {}
+    for country, states in configured.items():
+        if not isinstance(country, str) or not isinstance(states, dict):
+            continue
+        cleaned_states: dict[str, list[str]] = {}
+        for state, districts in states.items():
+            if not isinstance(state, str):
+                continue
+            if isinstance(districts, list):
+                cleaned_states[state] = [str(d) for d in districts if isinstance(d, (str, int))]
+            else:
+                cleaned_states[state] = []
+        locations[country] = cleaned_states
+
+    return locations or DEFAULT_LOCATIONS
+
+
+def load_grades(topics_catalog: dict[str, Any] | None = None, config: dict[str, Any] | None = None) -> list[str]:
+    """Return available grade options derived from topics.json or config.json."""
+    if config and isinstance(config.get("grades"), list) and config["grades"]:
+        return [str(g) for g in config["grades"]]
+
+    grades_dict = (topics_catalog.get("grades") if topics_catalog else None) or {}
+    if isinstance(grades_dict, dict) and grades_dict:
+        import re
+
+        def sort_key(label: str) -> tuple[int, str]:
+            match = re.search(r"\d+", label)
+            return (int(match.group()), label) if match else (0, label)
+
+        return sorted(grades_dict.keys(), key=sort_key)
+
+    return [f"Grade {number}" for number in range(1, 13)]
+
+
+DEFAULT_SUBJECTS = ["Maths", "English", "Science", "General Knowledge", "Others"]
+
+
+TOPIC_SECTIONS = ("schools", "default", "subjects", "grades")
+
+
+def _require_mapping(section: str, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"topics.json '{section}' must be a JSON object.")
+    return value
+
+
+def load_topics() -> dict[str, Any]:
+    """Return the topic catalog configured in topics.json.
+
+    The file has two main sections:
+        "schools": school district -> "Grade N" -> subject -> specific topic overrides
+                   (e.g. "Charlotte-Mecklenburg Schools")
+        "default": fallback values when a school/grade/subject has no specific entry,
+                   or for schools outside configured districts:
+                   "grades" -> "Grade N" -> subject -> topics
+                   "subjects" -> subject -> topics (general/grade-independent fallback)
+
+    Legacy sections ("grades", "subjects" at top level) are also supported for backward compatibility.
+    A missing topics.json leaves the built-in subjects with free-text topics.
+    """
+    empty_catalog: dict[str, Any] = {
+        "schools": {},
+        "default": {},
+        "grades": {},
+        "subjects": {subject: [] for subject in DEFAULT_SUBJECTS},
+    }
+    try:
+        path = _resolve_config_path("topics.json")
+        with path.open(encoding="utf-8") as file:
+            configured = json.load(file)
+    except FileNotFoundError:
+        return empty_catalog
+    if not isinstance(configured, dict):
+        raise ValueError("topics.json must contain a JSON object with 'schools' and 'default' sections.")
+    unknown = sorted(set(configured) - set(TOPIC_SECTIONS))
+    if unknown:
+        raise ValueError(f"topics.json has unknown section(s): {', '.join(unknown)}. Use 'schools' and 'default'.")
+
+    catalog: dict[str, Any] = {
+        "schools": {},
+        "default": {},
+        "grades": {},
+        "subjects": {},
+    }
+
+    if "schools" in configured:
+        catalog["schools"] = _require_mapping("schools", configured["schools"])
+
+    if "default" in configured:
+        catalog["default"] = _require_mapping("default", configured["default"])
+
+    default_obj = catalog["default"]
+    grades_dict: dict[str, Any] = {}
+    if isinstance(default_obj.get("grades"), dict):
+        grades_dict = dict(default_obj["grades"])
+    else:
+        for key, value in default_obj.items():
+            if isinstance(value, dict):
+                grades_dict[key] = value
+
+    if "grades" in configured and not grades_dict:
+        grades_dict = _require_mapping("grades", configured["grades"])
+
+    catalog["grades"] = grades_dict
+
+    discovered_subjects: list[str] = []
+    for subj in DEFAULT_SUBJECTS:
+        if subj not in discovered_subjects:
+            discovered_subjects.append(subj)
+
+    for grade_data in grades_dict.values():
+        if isinstance(grade_data, dict):
+            for subj in grade_data:
+                if subj not in discovered_subjects:
+                    discovered_subjects.append(subj)
+
+    for key, value in default_obj.items():
+        if isinstance(value, list) and key not in discovered_subjects:
+            discovered_subjects.append(key)
+
+    top_subjects = configured.get("subjects") if isinstance(configured.get("subjects"), dict) else {}
+    for subj in top_subjects:
+        if subj not in discovered_subjects:
+            discovered_subjects.append(subj)
+
+    subjects_dict: dict[str, list[str]] = {}
+    for subj in discovered_subjects:
+        if isinstance(default_obj.get(subj), list):
+            subjects_dict[subj] = default_obj[subj]
+        elif isinstance(default_obj.get("subjects"), dict) and isinstance(default_obj["subjects"].get(subj), list):
+            subjects_dict[subj] = default_obj["subjects"][subj]
+        elif isinstance(top_subjects.get(subj), list):
+            subjects_dict[subj] = top_subjects[subj]
+        else:
+            subjects_dict[subj] = []
+
+    catalog["subjects"] = subjects_dict
+    return catalog
+
+
+def resolve_subjects(catalog: dict[str, Any], grade: str = "", school_district: str = "") -> list[str]:
+    """Subject list for the current School -> Grade selection.
+
+    Priority:
+    1. Subjects defined for the school district's grade entry (school-specific)
+    2. Subjects defined in the default grade entry
+    3. Global default subject list from catalog["subjects"]
+    """
+    schools = catalog.get("schools") or {}
+    school = schools.get(school_district) if isinstance(schools, dict) else None
+    school_grade = school.get(grade) if isinstance(school, dict) else None
+
+    default_obj = catalog.get("default") if isinstance(catalog.get("default"), dict) else {}
+    default_grade = None
+    if isinstance(default_obj.get("grades"), dict):
+        default_grade = default_obj["grades"].get(grade)
+    elif isinstance(default_obj.get(grade), dict):
+        default_grade = default_obj.get(grade)
+    elif isinstance(catalog.get("grades"), dict):
+        default_grade = catalog["grades"].get(grade)
+
+    # 1. School-specific subjects for this grade
+    if isinstance(school_grade, dict):
+        subjects = list(school_grade.keys())
+        if subjects:
+            return subjects
+
+    # 2. Default grade subjects
+    if isinstance(default_grade, dict):
+        subjects = list(default_grade.keys())
+        if subjects:
+            return subjects
+
+    # 3. Global subject list
+    subjects_dict = catalog.get("subjects")
+    if isinstance(subjects_dict, dict):
+        return list(subjects_dict.keys())
+
+    return DEFAULT_SUBJECTS
+
+
+def resolve_topics(catalog: dict[str, Any], subject: str, grade: str = "", school_district: str = "") -> list[str]:
+    """Topic list for the current School -> Grade -> Subject selection.
+
+    The most specific entry wins:
+    1. The school's own list for that grade and subject (e.g. "Charlotte-Mecklenburg Schools")
+    2. The default grade list for that subject
+    3. The default general subject list (e.g. "General Knowledge")
+    An empty result keeps the free-text topic box, so a sparse file never blocks a test.
+    """
+    schools = catalog.get("schools") or {}
+    school = schools.get(school_district) if isinstance(schools, dict) else None
+    school_grade = school.get(grade) if isinstance(school, dict) else None
+
+    default_obj = catalog.get("default") if isinstance(catalog.get("default"), dict) else {}
+    default_grade = None
+    if isinstance(default_obj.get("grades"), dict):
+        default_grade = default_obj["grades"].get(grade)
+    elif isinstance(default_obj.get(grade), dict):
+        default_grade = default_obj.get(grade)
+    elif isinstance(catalog.get("grades"), dict):
+        default_grade = catalog["grades"].get(grade)
+
+    # 1. School-specific override
+    if isinstance(school_grade, dict):
+        topics = school_grade.get(subject)
+        if isinstance(topics, list) and topics:
+            return [str(topic) for topic in topics]
+
+    # 2. Default grade-specific topics
+    if isinstance(default_grade, dict):
+        topics = default_grade.get(subject)
+        if isinstance(topics, list) and topics:
+            return [str(topic) for topic in topics]
+
+    # 3. Default general / grade-independent topics (e.g. General Knowledge)
+    if isinstance(default_obj.get(subject), list) and default_obj[subject]:
+        return [str(topic) for topic in default_obj[subject]]
+
+    subjects_dict = default_obj.get("subjects") if isinstance(default_obj.get("subjects"), dict) else catalog.get("subjects")
+    if isinstance(subjects_dict, dict):
+        topics = subjects_dict.get(subject)
+        if isinstance(topics, list) and topics:
+            return [str(topic) for topic in topics]
+
+    return []
+
+
+def describe_topic_source(catalog: dict[str, Any], subject: str, grade: str = "", school_district: str = "") -> str:
+    """Return a human-friendly description of where the topics came from."""
+    schools = catalog.get("schools") or {}
+    school = schools.get(school_district) if isinstance(schools, dict) else None
+    school_grade = school.get(grade) if isinstance(school, dict) else None
+    if isinstance(school_grade, dict) and isinstance(school_grade.get(subject), list) and school_grade[subject]:
+        return f"{school_district} · {grade} · {subject}"
+
+    default_obj = catalog.get("default") if isinstance(catalog.get("default"), dict) else {}
+    default_grade = None
+    if isinstance(default_obj.get("grades"), dict):
+        default_grade = default_obj["grades"].get(grade)
+    elif isinstance(default_obj.get(grade), dict):
+        default_grade = default_obj.get(grade)
+    elif isinstance(catalog.get("grades"), dict):
+        default_grade = catalog["grades"].get(grade)
+
+    if isinstance(default_grade, dict) and isinstance(default_grade.get(subject), list) and default_grade[subject]:
+        if school_district and school_district != "Select a school district":
+            return f"{grade} · {subject} (Default fallback for {school_district})"
+        return f"{grade} · {subject} (Default)"
+
+    if isinstance(default_obj.get(subject), list) and default_obj[subject]:
+        return f"{subject} (Default)"
+
+    subjects_dict = default_obj.get("subjects") if isinstance(default_obj.get("subjects"), dict) else catalog.get("subjects")
+    if isinstance(subjects_dict, dict) and isinstance(subjects_dict.get(subject), list) and subjects_dict[subject]:
+        return f"{subject} (Default)"
+
+    return ""
+
+
+def load_config() -> dict[str, Any]:
+    """Return the app settings configured in config.json.
+
+    Recognised keys are "timezone" (an IANA name), "timezone_label" (the clock
+    caption) and "defaults" (the starting value of each field on the setup
+    page). Anything unusable is described in the "warnings" list so the app can
+    report it in the sidebar instead of refusing to start.
+    """
+    settings: dict[str, Any] = {key: value for key, value in DEFAULT_CONFIG.items() if key != "defaults"}
+    settings["defaults"] = dict(DEFAULT_CONFIG["defaults"])
+    warnings: list[str] = []
+    try:
+        path = _resolve_config_path("config.json")
+        with path.open(encoding="utf-8") as file:
+            configured = json.load(file)
+    except FileNotFoundError:
+        configured = {}
+    if not isinstance(configured, dict):
+        raise ValueError("config.json must contain a JSON object.")
+    for key in ("timezone", "timezone_label"):
+        value = configured.get(key)
+        if isinstance(value, str) and value.strip():
+            settings[key] = value.strip()
+    unknown_top = sorted(set(configured) - set(DEFAULT_CONFIG))
+    if unknown_top:
+        warnings.append(f"config.json has unknown key(s): {', '.join(unknown_top)}.")
+    supplied = configured.get("defaults")
+    if supplied is not None:
+        if not isinstance(supplied, dict):
+            warnings.append("config.json 'defaults' must be a JSON object. The built-in defaults are used instead.")
+        else:
+            unknown_keys = sorted(set(supplied) - set(DEFAULT_CONFIG["defaults"]))
+            if unknown_keys:
+                warnings.append(f"config.json 'defaults' has unknown key(s): {', '.join(unknown_keys)}.")
+            settings["defaults"].update({key: value for key, value in supplied.items() if key in DEFAULT_CONFIG["defaults"]})
+    try:
+        settings["zone"] = ZoneInfo(settings["timezone"])
+    except (KeyError, ValueError):
+        warnings.append(f"config.json timezone '{settings['timezone']}' is not a recognised IANA timezone. Falling back to {DEFAULT_CONFIG['timezone']}.")
+        settings["timezone"] = DEFAULT_CONFIG["timezone"]
+        settings["timezone_label"] = DEFAULT_CONFIG["timezone_label"]
+        settings["zone"] = ZoneInfo(settings["timezone"])
+    settings["warnings"] = warnings
+    return settings
 
 
 def unique_questions(questions: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
@@ -70,12 +459,9 @@ def historical_mistakes(db_path: Path, student_name: str, grade: str, subject: s
 
 def _api_key(model: dict[str, Any]) -> str:
     key_name = model.get("api_key_env", "")
-    try:
-        key = st.secrets.get(key_name) or os.getenv(key_name)
-    except Exception:
-        key = os.getenv(key_name)
+    key = read_setting(key_name)
     if not key:
-        raise RuntimeError(f"Missing API key. Add {key_name} to .env for {model['name']}.")
+        raise RuntimeError(f"Missing API key. Add {key_name} to .env or the app's Streamlit secrets for {model['name']}.")
     return str(key)
 
 

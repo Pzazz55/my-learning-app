@@ -1,0 +1,23 @@
+[project]
+name = "my-learning-app"
+version = "0.1.0"
+description = "A Streamlit education app for grade-aware multiple-choice exams, timed student sessions, local result storage, and parent review."
+readme = "README.md"
+authors = [
+    { name = "Pzazz55", email = "Pzazz55@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv>=1.0.1",
+    "requests>=2.31.0",
+    "streamlit>=1.64.0",
+    "streamlit-autorefresh>=1.0.1",
+    "tzdata>=2024.1",
+]
+
+[project.scripts]
+my-learning-app = "my_learning_app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

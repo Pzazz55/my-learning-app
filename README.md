@@ -13,6 +13,31 @@ streamlit run learning-home.py
 
 The app uses SQLite in `education_app.db`, created automatically on first run. Open **Parent Results** from the Streamlit page navigation to review completed exams.
 
+### Manual Database Creation
+
+If you prefer to create the database manually before running the app, use the provided scripts:
+
+**Windows:**
+```powershell
+.\init_database.bat
+```
+
+**Unix/Linux/macOS:**
+```bash
+chmod +x init_database.sh
+./init_database.sh
+```
+
+**Or manually with SQLite:**
+```bash
+sqlite3 education_app.db < create_database.sql
+```
+
+The database schema includes:
+- `exams` table: Stores completed exam results with student details, scores, and question data
+- `question_sets` table: Stores generated question sets for reusability
+- Performance indexes on commonly queried columns
+
 ## Project structure
 
 | Path | Purpose |
@@ -25,6 +50,9 @@ The app uses SQLite in `education_app.db`, created automatically on first run. O
 | `requirements.txt` | Runtime dependencies installed by Streamlit Community Cloud |
 | `_verify_changes.py` | End-to-end check driven by `streamlit.testing.v1.AppTest` |
 | `.streamlit/secrets.toml.example` | Template for the secrets to paste into Community Cloud |
+| `create_database.sql` | SQL script for manual database creation |
+| `init_database.bat` | Windows script to initialize the database |
+| `init_database.sh` | Unix script to initialize the database |
 
 ## Deploy to Streamlit Community Cloud
 

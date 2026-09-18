@@ -2,4 +2,7 @@ streamlit>=1.64.0
 streamlit-autorefresh>=1.0.1
 requests>=2.31.0
 python-dotenv>=1.0.1
+sqlalchemy>=2.0.36
+psycopg[binary]>=3.2.3
+libsql-client>=0.5.0
 tzdata>=2024.1

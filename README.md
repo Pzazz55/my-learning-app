@@ -20,6 +20,7 @@ The app uses SQLite in `education_app.db`, created automatically on first run. O
 | `learning-home.py` | Student entry point — setup form, timed exam, celebration screen |
 | `pages/parent-results.py` | Parent Results page (sign-in, filters, answer review, delete) |
 | `llm_backend.py` | Config loading, subject/topic resolution, provider routing, question generation |
+| `storage.py` | Database layer with support for SQLite, Turso (libsql), and PostgreSQL |
 | `config/` | `config.json`, `locations.json`, `topics.json`, `models.json` |
 | `requirements.txt` | Runtime dependencies installed by Streamlit Community Cloud |
 | `_verify_changes.py` | End-to-end check driven by `streamlit.testing.v1.AppTest` |
@@ -73,7 +74,62 @@ Points to keep in mind once deployed:
 
 ### Data persistence on Community Cloud
 
-`education_app.db` is written inside the app container. Community Cloud hibernates an app after 12 hours without traffic and rebuilds the container when you reboot or redeploy it, so saved results live only for the current container lifetime — they are **not** a permanent archive. Use the local install when the results history must be kept long term, or move storage to an external database before treating the hosted app as the system of record.
+`education_app.db` is written inside the app container. Community Cloud hibernates an app after 12 hours without traffic and rebuilds the container when you reboot or redeploy it, so saved results live only for the current container lifetime — they are **not** a permanent archive.
+
+**Recommended: Use Turso (SQLite Flash) for persistent storage**
+
+Turso provides a free, managed SQLite database with cloud persistence and edge caching. To set it up:
+
+1. Create a free account at [https://app.turso.tech/](https://app.turso.tech/)
+2. Create a new database and get your database URL
+3. Add `DATABASE_URL` to your Streamlit secrets with format:
+   ```toml
+   DATABASE_URL = "libsql://your-auth-token@your-db.turso.io/your-db-name"
+   ```
+4. The app will automatically use Turso instead of the local SQLite file
+
+Alternatively, you can use PostgreSQL (Neon, Supabase, etc.) by setting `DATABASE_URL` to a PostgreSQL connection string. Use the local install when the results history must be kept long term, or move storage to an external database before treating the hosted app as the system of record.
+
+## Turso Database Setup (Recommended for Production)
+
+Turso (SQLite Flash) is a free, managed SQLite database that provides cloud persistence and edge caching. It's the recommended option for production deployments.
+
+### Setting up Turso
+
+1. **Create a Turso account** at [https://app.turso.tech/](https://app.turso.tech/)
+2. **Create a database**:
+   - Click "Create Database" 
+   - Choose a name (e.g., `study-sprint`)
+   - Select a region closest to your users
+3. **Get your database URL**:
+   - Navigate to your database
+   - Click "Get Started" or "Connection URL"
+   - Copy the database URL in format: `libsql://your-auth-token@your-db.turso.io/your-db-name`
+
+### Configure the app to use Turso
+
+**For Streamlit Community Cloud:**
+- Add to the app's **Advanced settings → Secrets** box:
+  ```toml
+  DATABASE_URL = "libsql://your-auth-token@your-db.turso.io/your-db-name"
+  ```
+
+**For local development:**
+- Add to your `.env` file:
+  ```env
+  DATABASE_URL=libsql://your-auth-token@your-db.turso.io/your-db-name
+  ```
+- Or save as `.streamlit/secrets.toml` (excluded from Git)
+
+The app will automatically detect the Turso URL and use it instead of the local SQLite file.
+
+### Turso Benefits
+
+- **Free tier** includes 500MB storage and 1 billion row reads per month
+- **SQLite compatibility** - no schema changes needed
+- **Edge caching** - fast reads from global edge locations
+- **Automatic backups** and point-in-time recovery
+- **Easy migration** from local SQLite
 
 ## LLM questions
 

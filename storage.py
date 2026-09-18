@@ -24,9 +24,12 @@ primary-key definition (``AUTOINCREMENT`` versus ``IDENTITY``) for each dialect.
 
 from __future__ import annotations
 
+import json
 import threading
 from typing import Any, Mapping
 from urllib.parse import urlsplit
+
+import requests
 
 from sqlalchemy import (
     Column,
@@ -99,7 +102,6 @@ EXAM_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
 
 _lock = threading.RLock()
 _engine: Engine | None = None
-_turso_client: Any = None
 _schema_ready = False
 
 
@@ -153,22 +155,66 @@ def _configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:
     cursor.close()
 
 
-def _get_turso_client() -> Any:
-    """Return the Turso libsql client, creating it on first use."""
-    global _turso_client
-    if not TURSO_AVAILABLE:
-        raise RuntimeError("libsql-client is not installed. Add it to requirements.txt to use Turso.")
+def _get_turso_http_client() -> tuple[str, str]:
+    """Return Turso HTTP endpoint and auth token for direct HTTP requests."""
+    url = database_url()
+    if not url.startswith("libsql://"):
+        raise RuntimeError(f"DATABASE_URL must start with libsql:// for Turso, got: {url}")
     
-    with _lock:
-        if _turso_client is None:
-            url = database_url()
-            if not url.startswith("libsql://"):
-                raise RuntimeError(f"DATABASE_URL must start with libsql:// for Turso, got: {url}")
-            
-            # Parse Turso URL: libsql://username-auth-token@host/dbname
-            # Turso uses authentication token in the URL
-            _turso_client = create_client(url=url)
-        return _turso_client
+    parsed = urlsplit(url)
+    
+    # Extract auth token from URL
+    auth_token = parsed.username or ""
+    
+    # Convert libsql:// to https:// for HTTP requests
+    # Format: https://hostname/path
+    http_url = f"https://{parsed.hostname}{parsed.path}"
+    
+    return http_url, auth_token
+
+
+def _turso_execute(sql: str, params: list[Any] | None = None) -> Any:
+    """Execute SQL query using Turso HTTP API."""
+    http_url, auth_token = _get_turso_http_client()
+    
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json"
+    }
+    
+    # Use parameters directly if provided
+    sql_str = sql
+    param_list = params if params else []
+    
+    payload = {
+        "statements": [
+            {
+                "q": sql_str,
+                "params": param_list
+            }
+        ]
+    }
+    
+    response = requests.post(http_url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    
+    result = response.json()
+    
+    # Handle different response formats from Turso
+    if isinstance(result, list):
+        # Turso returns a list of statement results
+        if len(result) > 0 and result[0].get("error"):
+            raise RuntimeError(f"Turso query error: {result[0]['error']}")
+        # Extract the actual results from the first statement
+        if len(result) > 0 and result[0].get("results"):
+            return {"results": [result[0]["results"]]}
+        return {"results": result}
+    elif isinstance(result, dict):
+        if result.get("results") and result["results"][0].get("error"):
+            raise RuntimeError(f"Turso query error: {result['results'][0]['error']}")
+        return result
+    
+    return result
 
 
 def get_engine() -> Engine | None:
@@ -197,22 +243,26 @@ def _upgrade_exam_columns(engine: Engine | None = None) -> None:
     """Add columns that were introduced after a database was first created."""
     if is_turso():
         # For Turso, we need to handle schema upgrades differently
-        client = _get_turso_client()
         try:
-            result = client.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='exams'")
-            if not result.rows:
+            result = _turso_execute("SELECT name FROM sqlite_master WHERE type='table' AND name='exams'")
+            if not result or not result.get("results") or not result["results"][0].get("rows"):
                 return
             
             # Get existing columns
-            result = client.execute("PRAGMA table_info(exams)")
-            existing = {row[1] for row in result.rows}  # row[1] is the column name
+            result = _turso_execute("PRAGMA table_info(exams)")
+            existing = set()
+            if result and result.get("results") and result["results"][0].get("rows"):
+                for row in result["results"][0]["rows"]:
+                    if len(row) > 1:
+                        existing.add(row[1])  # row[1] is the column name
             
             for name, definition in EXAM_COLUMN_MIGRATIONS:
                 if name in existing:
                     continue
-                client.execute(f"ALTER TABLE exams ADD COLUMN {name} {definition}")
-        except Exception:
+                _turso_execute(f"ALTER TABLE exams ADD COLUMN {name} {definition}")
+        except Exception as e:
             # If upgrade fails, we'll try again on next run
+            print(f"Turso column upgrade failed: {e}")
             pass
         return
     
@@ -241,10 +291,8 @@ def ensure_schema() -> None:
             return
         
         if is_turso():
-            client = _get_turso_client()
-            
-            # Create tables using raw SQL for Turso
-            client.execute("""
+            # Create tables using raw SQL for Turso via HTTP API
+            _turso_execute("""
                 CREATE TABLE IF NOT EXISTS exams (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     student_name TEXT NOT NULL,
@@ -266,7 +314,7 @@ def ensure_schema() -> None:
                 )
             """)
             
-            client.execute("""
+            _turso_execute("""
                 CREATE TABLE IF NOT EXISTS question_sets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     student_name TEXT NOT NULL,
@@ -278,7 +326,7 @@ def ensure_schema() -> None:
                 )
             """)
             
-            _upgrade_exam_columns(None)  # Pass None since we're using client directly
+            _upgrade_exam_columns(None)  # Pass None since we're using HTTP client directly
         else:
             engine = get_engine()
             metadata.create_all(engine)
@@ -292,24 +340,20 @@ def fetch_all(sql: str, params: Mapping[str, Any] | None = None) -> list[dict[st
     ensure_schema()
     
     if is_turso():
-        client = _get_turso_client()
-        # Convert named parameters to positional for libsql-client
-        if params:
-            # Replace :name with ? and extract params in order
-            import re
-            param_names = re.findall(r':(\w+)', sql)
-            sql_str = re.sub(r':\w+', '?', sql)
-            param_list = [params.get(name) for name in param_names]
-            result = client.execute(sql_str, param_list)
-        else:
-            result = client.execute(sql)
+        # Convert named parameters to positional for Turso HTTP API
+        import re
+        param_names = re.findall(r':(\w+)', sql)
+        sql_str = re.sub(r':\w+', '?', sql)
+        param_list = [params.get(name) for name in param_names] if params else []
         
-        # Convert result to list of dicts
-        if hasattr(result, 'columns') and hasattr(result, 'rows'):
-            columns = [col.name for col in result.columns]
-            return [dict(zip(columns, row)) for row in result.rows]
+        result = _turso_execute(sql_str, param_list)
+        
+        # Convert Turso HTTP result to list of dicts
+        if result and result.get("results") and result["results"][0].get("rows"):
+            columns = result["results"][0].get("columns", [])
+            rows = result["results"][0]["rows"]
+            return [dict(zip(columns, row)) for row in rows]
         else:
-            # Fallback for different result format
             return []
     
     with get_engine().connect() as connection:
@@ -326,21 +370,18 @@ def execute(sql: str, params: Mapping[str, Any] | None = None) -> int | None:
     ensure_schema()
     
     if is_turso():
-        client = _get_turso_client()
-        # Convert named parameters to positional for libsql-client
-        if params:
-            import re
-            param_names = re.findall(r':(\w+)', sql)
-            sql_str = re.sub(r':\w+', '?', sql)
-            param_list = [params.get(name) for name in param_names]
-            result = client.execute(sql_str, param_list)
-        else:
-            result = client.execute(sql)
+        # Convert named parameters to positional for Turso HTTP API
+        import re
+        param_names = re.findall(r':(\w+)', sql)
+        sql_str = re.sub(r':\w+', '?', sql)
+        param_list = [params.get(name) for name in param_names] if params else []
+        
+        result = _turso_execute(sql_str, param_list)
         
         # Check if this is a RETURNING query
         if "RETURNING" in sql.upper():
-            if hasattr(result, 'rows') and result.rows:
-                return int(result.rows[0][0]) if result.rows[0][0] is not None else None
+            if result and result.get("results") and result["results"][0].get("rows"):
+                return int(result["results"][0]["rows"][0][0]) if result["results"][0]["rows"][0][0] is not None else None
         return None
     
     with get_engine().begin() as connection:
@@ -356,11 +397,10 @@ def existing_columns(table: str) -> set[str]:
     ensure_schema()
     
     if is_turso():
-        client = _get_turso_client()
         try:
-            result = client.execute(f"PRAGMA table_info({table})")
-            if hasattr(result, 'rows'):
-                return {row[1] for row in result.rows}  # row[1] is the column name
+            result = _turso_execute(f"PRAGMA table_info({table})")
+            if result and result.get("results") and result["results"][0].get("rows"):
+                return {row[1] for row in result["results"][0]["rows"] if len(row) > 1}  # row[1] is the column name
         except Exception:
             return set()
         return set()

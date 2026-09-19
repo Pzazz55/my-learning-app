@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -113,8 +114,6 @@ def load_grades(topics_catalog: dict[str, Any] | None = None, config: dict[str, 
 
     grades_dict = (topics_catalog.get("grades") if topics_catalog else None) or {}
     if isinstance(grades_dict, dict) and grades_dict:
-        import re
-
         def sort_key(label: str) -> tuple[int, str]:
             match = re.search(r"\d+", label)
             return (int(match.group()), label) if match else (0, label)
@@ -489,14 +488,67 @@ def _request_text(model: dict[str, Any], prompt: str, temperature: float, max_to
     raise RuntimeError(f"Unsupported model provider: {provider}")
 
 
-def generate_questions(model: dict[str, Any], subject: str, grade: str, count: int, school_state: str = "", school_district: str = "", topic: str = "", student_name: str = "", temperature: float = 0.3, include_visuals: bool = False) -> tuple[list[dict[str, Any]], str]:
+def _difficulty_hint(grade: str) -> str:
+    """Return an explicit difficulty instruction for the given grade label.
+
+    The grade is also written verbatim into the prompt, but a bare label such as
+    "Grade 6" leaves the model guessing at the intended level. This maps the
+    numeric part of the label to a concrete difficulty band so a Grade 6 paper is
+    genuinely harder than a Grade 4 paper. Non-numeric labels ("Kindergarten")
+    fall back to an early-years instruction, and an empty label adds nothing.
+    """
+    label = (grade or "").strip()
+    if not label:
+        return ""
+    match = re.search(r"\d+", label)
+    if not match:
+        return " Calibrate every question to age-appropriate early-years difficulty: single-step tasks, concrete everyday contexts, and simple vocabulary."
+    number = int(match.group())
+    if number <= 2:
+        band = "very simple single-step questions, small whole numbers, concrete everyday contexts, and basic vocabulary"
+    elif number <= 5:
+        band = "simple, mostly single-step questions with clear real-world contexts and straightforward vocabulary"
+    elif number <= 8:
+        band = "moderately challenging questions that often need two steps, applied reasoning, and grade-level vocabulary"
+    else:
+        band = "challenging multi-step questions requiring analysis, abstract reasoning, and precise academic vocabulary"
+    return f" Calibrate difficulty precisely to {label}: use {band} — this level must be clearly harder than the grade below it and easier than the grade above."
+
+
+def generate_questions(model: dict[str, Any], subject: str, grade: str, count: int, school_state: str = "", school_district: str = "", topic: str = "", student_name: str = "", temperature: float = 0.3, include_visuals: bool = False, country: str = "") -> tuple[list[dict[str, Any]], str]:
     mistakes = historical_mistakes(student_name, grade, subject, topic) if student_name else []
-    district_context = f" The student is in {school_state}, United States, and attends {school_district}. Align with this district's publicly available curriculum." if school_district else ""
-    topic_context = f" The requested topic is {topic}." if topic else ""
-    mistake_context = f" Prior incorrect questions to target are {mistakes}. Test the same skills with new wording, numbers, or contexts." if mistakes else ""
+
+    # Build an explicit location context so the model tailors content and
+    # examples to the student's own country, state/region and school district
+    # instead of producing generic questions.
+    location_parts = [part for part in (school_district, school_state, country) if part and part.strip()]
+    location_context = ""
+    if location_parts:
+        location_context = (
+            f" The student lives in {country or 'their country'}"
+            + (f", in the state/region of {school_state}" if school_state else "")
+            + (f", and attends {school_district}" if school_district else "")
+            + ". Align the curriculum, examples, names, places, currency, units of measurement and any real-world contexts with this location"
+            + (" and this district's publicly available curriculum" if school_district else "")
+            + ". Do not use examples that would only make sense elsewhere."
+        )
+
+    topic_context = ""
+    if topic:
+        topic_context = f" Focus every question on the specific topic '{topic}' — the questions must be directly about this topic, not the wider subject."
+    grade_context = f" These questions are for a {grade} student." if grade else ""
+    difficulty_context = _difficulty_hint(grade)
+    mistake_context = f" Prioritise revisiting these skills the student previously got wrong: {mistakes}. Test the same skills with fresh wording, numbers and contexts." if mistakes else ""
     visual_context = " Visual references are allowed for some questions when useful." if include_visuals else " Do not refer to pictures, diagrams, charts, maps, images, or anything the student cannot see. Every question must be answerable from text alone."
     question_subject = topic if subject == "Others" and topic else subject
-    prompt = f"Create exactly {count} multiple-choice questions for {grade} students in {question_subject}.{topic_context}{district_context}{mistake_context}{visual_context} Questions must be unique within this exam. Vary recall, application, reasoning, vocabulary, and real-world contexts. Return only a JSON array with no markdown. Each item must have question, options (exactly four strings), and answer (one option string)."
+    prompt = (
+        f"Create exactly {count} multiple-choice questions at the level of the subject {question_subject},"
+        f" for {grade} students in {country or 'their country'}."
+        f"{grade_context}{topic_context}{difficulty_context}{location_context}{mistake_context}{visual_context}"
+        " Questions must be unique within this exam and must not be generic filler — each question must reflect"
+        " the specified location, grade level and topic. Vary recall, application, reasoning, vocabulary, and real-world contexts."
+        " Return only a JSON array with no markdown. Each item must have question, options (exactly four strings), and answer (one option string)."
+    )
     last_error = "unknown response"
     for _ in range(3):
         try:

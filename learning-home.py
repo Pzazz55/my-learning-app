@@ -373,7 +373,7 @@ def show_setup() -> None:
             return
         with st.spinner("Preparing your questions..."):
             try:
-                questions, source = generate_questions_from_backend(selected_model, subject, grade, count, school_state, school_district, topic_value, str(name).strip(), temperature, include_images)
+                questions, source = generate_questions_from_backend(selected_model, subject, grade, count, school_state, school_district, topic_value, str(name).strip(), temperature, include_images, country=country)
             except RuntimeError as error:
                 st.error(str(error))
                 return

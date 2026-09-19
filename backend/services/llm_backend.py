@@ -45,18 +45,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def load_models() -> list[dict[str, Any]]:
+    """Return every model listed in models.json (filtered only by ``enabled``).
+
+    API-key availability is intentionally *not* used to hide models here: the
+    sidebar lists all configured providers, and a model whose key is missing is
+    flagged in the UI instead of silently disappearing. ``model_key_available``
+    reports key presence for that labelling and for the pre-flight check.
+    """
     path = _resolve_config_path("models.json")
     with path.open(encoding="utf-8") as file:
         models = json.load(file)
-    available = []
-    for model in models:
-        if not model.get("enabled", True):
-            continue
-        key_name = model.get("api_key_env", "")
-        key = read_setting(key_name)
-        if key:
-            available.append(model)
-    return available
+    return [model for model in models if model.get("enabled", True)]
+
+
+def model_key_available(model: dict[str, Any]) -> bool:
+    """Return True when the API key configured for ``model`` is present."""
+    key_name = model.get("api_key_env", "")
+    return bool(key_name) and bool(read_setting(key_name))
 
 
 DEFAULT_LOCATIONS: dict[str, dict[str, list[str]]] = {

@@ -11,7 +11,7 @@ pip install -r requirements.txt
 streamlit run learning-home.py
 ```
 
-The app uses SQLite in `education_app.db`, created automatically on first run. Open **Parent Results** from the Streamlit page navigation to review completed exams.
+The app uses SQLite in `education_app.db`, created automatically on first run. The first screen is the **Parent Login / Sign-Up** page; after signing in you can start exams, review **Student Results** and edit the **Parent Profile** from the in-app buttons.
 
 ### Manual Database Creation
 
@@ -42,11 +42,15 @@ The database schema includes:
 
 | Path | Purpose |
 | --- | --- |
-| `learning-home.py` | Student entry point — setup form, timed exam, celebration screen |
-| `pages/parent-results.py` | Parent Results page (sign-in, filters, answer review, delete) |
+| `learning-home.py` | App entry point — requires parent login, then setup form, timed exam, celebration screen |
+| `pages/parent-login.py` | First screen: Parent Sign In (with Google OAuth + password reset) and Sign Up in one page |
+| `pages/student-results.py` | Student Results page (student selector, filters, answer review, delete) |
+| `pages/parent-profile.py` | Parent Profile — view/edit the parent and student profile |
+| `backend/services/logging_config.py` | Shared logging setup; writes rotating logs to `logs/app.log` |
 | `llm_backend.py` | Config loading, subject/topic resolution, provider routing, question generation |
 | `storage.py` | Database layer with support for SQLite, Turso (libsql), and PostgreSQL |
 | `config/` | `config.json`, `locations.json`, `topics.json`, `models.json` |
+| `logs/` | Runtime log output (`app.log`); contents are git-ignored |
 | `requirements.txt` | Runtime dependencies installed by Streamlit Community Cloud |
 | `_verify_changes.py` | End-to-end check driven by `streamlit.testing.v1.AppTest` |
 | `.streamlit/secrets.toml.example` | Template for the secrets to paste into Community Cloud |
@@ -177,6 +181,15 @@ OPENROUTER_API_KEY=your-openrouter-key
 
 The same names work in `.streamlit/secrets.toml` locally and in the **Secrets** box on Streamlit Community Cloud. The `.env` file is excluded from Git.
 
+## Logging
+
+Logging is configured once by `backend/services/logging_config.py`. Every module calls `get_logger(__name__)` and the first call sets up the root logger with:
+
+- a console handler (visible in the Streamlit terminal), and
+- a rotating file handler writing to `logs/app.log` (5 MB per file, 3 backups).
+
+The `logs/` directory is created automatically and its contents are git-ignored. Key events such as sign-in/sign-out, successful or failed logins, registrations, exam submissions, result deletions and profile updates are logged.
+
 ## Configuration directory (`config/`)
 
 All application settings, location hierarchies, topics, and model provider configurations are organized in the `config/` folder:
@@ -284,7 +297,9 @@ The selected topic is saved with the exam, focuses the generated questions, and 
 
 ## Parent results login
 
-The Parent Results page requires a login. Credentials are stored in `.env` using `PARENT_USERNAME` and `PARENT_PASSWORD`.
+The whole application is parent-gated: the first screen is the **Parent Login / Sign-Up** page (`pages/parent-login.py`), which contains a **Sign In** tab and a **Sign Up** tab. Sign-up creates the parent account and their first student, then signs the parent straight in. Once signed in, the Sign Up tab is never shown again — visiting the page just offers to return to the workspace.
+
+Sign in supports both manual credential accounts and Google OAuth, plus an email-OTP password reset for manual accounts.
 
 Authenticated parents can delete saved tests after confirming the deletion.
 

@@ -1,0 +1,14 @@
+# Streamlit configuration for Study Sprint.
+[client]
+# The app provides its own in-app navigation (buttons for Student Results,
+# Parent Profile and Sign out). Disabling the automatic multipage sidebar
+# keeps the first screen clean: an unauthenticated visitor only sees the
+# Parent Login / Sign-Up page, never the workspace pages.
+showSidebarNavigation = false
+
+[theme]
+# The in-app "Appearance" switch (Light/Dark) applies its own CSS. Streamlit's
+# built-in widgets (menus, expanders, dataframes, popovers) should follow the
+# light baseline so the Light theme has no dark patches; the Dark CSS then
+# overrides everything it needs to when Dark is selected.
+base = "light"

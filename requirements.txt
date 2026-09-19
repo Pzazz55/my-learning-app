@@ -6,3 +6,6 @@ sqlalchemy>=2.0.36
 psycopg[binary]>=3.2.3
 libsql-client>=0.3.0
 tzdata>=2024.1
+google-auth>=2.23.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.100.0

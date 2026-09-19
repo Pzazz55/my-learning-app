@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import json
-import hmac
 from html import escape
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 
-from dotenv import load_dotenv
 import streamlit as st
-from llm_backend import load_config, load_grades, load_topics, read_setting
 
-DB_PATH = Path(__file__).parent.parent / "education_app.db"
-load_dotenv(DB_PATH.parent / ".env")
+from backend.services import storage
+from backend.services.llm_backend import load_config, load_grades, load_locations, load_topics
+from backend.services.auth_storage import get_students_by_parent, get_exams_by_parent
+from backend.services.logging_config import get_logger
+from middleware import require_parent_auth, logout_parent, get_current_parent, set_current_student, get_current_student
+from ui.components.theme import inject_parent_theme
+from ui.components.appearance import render_appearance_toggle
+
+logger = get_logger(__name__)
+
 SUBJECT_CATALOG = list(load_topics()["subjects"])
 CONFIG = load_config()
+LOCATIONS = load_locations()
+COUNTRIES = list(LOCATIONS.keys())
+DEFAULTS = CONFIG.get("defaults", {})
 
 
 def format_question_time(seconds: float) -> str:
@@ -48,131 +54,132 @@ def format_options(options: list[str] | None) -> str:
         return "—"
     return "<br>".join(f"{letter}) {escape(str(option))}" for letter, option in zip("ABCDEFGH", options))
 
-st.set_page_config(page_title="Parent Results · Study Sprint", page_icon="▦", layout="wide")
-theme = st.sidebar.radio("Appearance", ["Light", "Dark"], index=1, horizontal=True, key="appearance")
-dark_theme = """
-    :root { --ink:#f6f7ff; --muted:#c2cbe0; --line:#455473; --sky:#5bbce8; --sun:#f6c94c; }
-    .stApp { background:linear-gradient(120deg,#17223a 0%,#24334e 48%,#193b42 100%); }
-    h1, h2, h3, .brand, .stMarkdown, .stMarkdown p, label, label p, .stCaption { color:#f6f7ff !important; }
-    .panel, div[data-testid="stExpander"] { background:#222e49; border-color:#455473; }
-    div[data-testid="stForm"] { background:#222e49; border:2px solid #5bbce8; border-radius:14px; padding:1.25rem; }
-    .stTextInput input, .stSelectbox [data-baseweb="select"], .stDataFrame { background:#263653; color:#f6f7ff; border-color:#5bbce8; }
-    .stSelectbox [data-baseweb="select"] * { color:#f6f7ff !important; -webkit-text-fill-color:#f6f7ff !important; opacity:1 !important; }
-    .stSelectbox [data-baseweb="select"] svg { opacity:0 !important; }
-    .stSelectbox [data-baseweb="select"] { position:relative; padding-right:2.2rem; }
-    .stSelectbox [data-baseweb="select"]::after { content:"▾"; position:absolute; right:.75rem; top:50%; transform:translateY(-50%); color:#bde8ff; font-size:1.1rem; font-weight:700; line-height:1; pointer-events:none; }
-    .stTextInput input::placeholder { color:#c2cbe0; opacity:1; }
-    div[role="listbox"], div[role="option"], [data-baseweb="popover"] { background:#263653; color:#f6f7ff; }
-    div[role="option"] * { color:#f6f7ff !important; }
-    [data-testid="stAlert"] { color:#f6f7ff; }
-    section[data-testid="stSidebar"], section[data-testid="stSidebar"] * { color:#f6f7ff !important; }
-    section[data-testid="stSidebar"] .stSelectbox .react-aria-ComboBox > div { background:#263653 !important; border:2px solid #5bbce8 !important; border-radius:10px; }
-    section[data-testid="stSidebar"] .stSelectbox input[role="combobox"] { background:#263653 !important; color:#f6f7ff !important; -webkit-text-fill-color:#f6f7ff !important; }
-    section[data-testid="stSidebar"] .stSelectbox button[aria-label="Open"] { background:#314563 !important; color:#bde8ff !important; }
-    section[data-testid="stSidebar"] .stSelectbox button[aria-label="Open"] svg { color:#bde8ff !important; fill:#bde8ff !important; stroke:#bde8ff !important; }
-    .stButton > button, .stFormSubmitButton > button { background:#f6c94c; color:#17223a; }
-    .stButton > button:hover, .stFormSubmitButton > button:hover { background:#ff927d; color:#17223a; }
-    div[data-testid="stMetric"] { background:#263653; border-color:#f6c94c; }
-    div[data-testid="stMetric"] *, div[data-testid="stMetricLabel"], div[data-testid="stMetricValue"] { color:#f6f7ff !important; -webkit-text-fill-color:#f6f7ff !important; }
-    div[data-testid="stExpander"] summary, div[data-testid="stExpander"] summary * { color:#f6f7ff !important; }
-    .results-table { width:100%; border-collapse:collapse; color:#f6f7ff; background:#263653; font-size:.9rem; }
-    .results-table th { background:#39516f; color:#fff; text-align:left; }
-    .results-table th, .results-table td { border:1px solid #5b7190; padding:.65rem; vertical-align:top; }
-    .stSidebar { background:#17223a; }
-""" if theme == "Dark" else ""
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
-    :root { --ink:#17324d; --muted:#526879; --line:#d6e5eb; --sky:#bde8ff; --sun:#ffd86b; }
-    html, body, [class*="css"] { font-family:'DM Sans', sans-serif; color:var(--ink); font-size:1.04rem; }
-    .stApp { background:linear-gradient(120deg,#fff4cf 0%,#dff3ff 48%,#e4f8eb 100%); }
-    h1,h2,h3 { font-family:'Space Grotesk',sans-serif !important; color:var(--ink) !important; }
-    .block-container { max-width:1150px; padding:3rem 2rem; }
-    .panel { background:#fff; border:2px solid #b7d4df; border-radius:12px; padding:1.25rem; }
-    .brand { font-family:'Space Grotesk'; font-weight:700; font-size:1.4rem; margin-bottom:3rem; color:var(--ink); }
-    .brand span { color:#f06f5d; }
-    label, label p, .stCaption { color:var(--ink) !important; font-weight:600; }
-    .stButton > button, .stFormSubmitButton > button { border-radius:12px; background:#ef705c; color:white; font-size:1.05rem; min-height:3rem; }
-    .stButton > button:hover, .stFormSubmitButton > button:hover { background:#ef705c; color:white; }
-    div[data-testid="stMetric"] { background:#fff; border:2px solid var(--sun); border-radius:12px; padding:1rem; }
-    .stTextInput input, .stSelectbox [data-baseweb="select"] { background:#fff; border:2px solid #79bfdc; color:var(--ink); }
-    .stSelectbox [data-baseweb="select"] * { color:#17324d !important; -webkit-text-fill-color:#17324d !important; opacity:1 !important; }
-    .stSelectbox [data-baseweb="select"] svg { opacity:0 !important; }
-    .stSelectbox [data-baseweb="select"] { position:relative; padding-right:2.2rem; }
-    .stSelectbox [data-baseweb="select"]::after { content:"▾"; position:absolute; right:.75rem; top:50%; transform:translateY(-50%); color:#17324d; font-size:1.1rem; font-weight:700; line-height:1; pointer-events:none; }
-    .results-table { width:100%; border-collapse:collapse; color:#17324d; background:#fff; font-size:.9rem; }
-    .results-table th { background:#dff3ff; color:#17324d; text-align:left; }
-    .results-table th, .results-table td { border:1px solid #b7d4df; padding:.65rem; vertical-align:top; }
-    """ + dark_theme + "</style>",
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title="Student Results · Study Sprint", page_icon="📊", layout="wide")
+theme = render_appearance_toggle(default=DEFAULTS.get("appearance", "Dark"))
+inject_parent_theme(theme)
 
-st.markdown('<div class="brand">study<span>·</span>sprint / parent view</div>', unsafe_allow_html=True)
+st.markdown('<div class="brand">study<span>·</span>sprint / student results</div>', unsafe_allow_html=True)
 
-expected_username = read_setting("PARENT_USERNAME")
-expected_password = read_setting("PARENT_PASSWORD")
+require_parent_auth()
 
-if not expected_username or not expected_password:
-    st.error("Parent credentials are not configured. Set PARENT_USERNAME and PARENT_PASSWORD in .streamlit/secrets.toml, Streamlit Cloud secrets, or .env.")
-    st.stop()
+# Get current parent and their students
+parent = get_current_parent()
+students = get_students_by_parent(parent["id"]) if parent else []
 
-if not st.session_state.get("parent_authenticated", False):
-    st.markdown("## Parent sign in")
-    st.caption("Sign in to review or manage saved exam results.")
-    with st.form("parent_login"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in", type="primary")
-    if submitted:
-        valid_username = hmac.compare_digest(username, expected_username)
-        valid_password = hmac.compare_digest(password, expected_password)
-        if valid_username and valid_password:
-            st.session_state.parent_authenticated = True
+# Student selection dropdown
+if students:
+    student_options = {f"{s['student_name']} ({s['student_id']})": s['student_id'] for s in students}
+    current_student_id = get_current_student()
+    
+    # Default to first student if none selected
+    if not current_student_id and students:
+        default_student = students[0]['student_id']
+        set_current_student(default_student)
+        current_student_id = default_student
+    
+    # Find the display name for current student
+    current_display = next((name for name, sid in student_options.items() if sid == current_student_id), list(student_options.keys())[0])
+    
+    # Single aligned row: student selector, then the three actions.
+    col1, col2, col3, col4 = st.columns([3, 1, 1, 1], vertical_alignment="bottom")
+    with col1:
+        selected_student_display = st.selectbox(
+            "Select Student",
+            options=list(student_options.keys()),
+            index=list(student_options.keys()).index(current_display) if current_display in student_options else 0,
+            key="student_selector"
+        )
+        
+        # Update current student when selection changes
+        if selected_student_display != current_display:
+            set_current_student(student_options[selected_student_display])
             st.rerun()
-        st.error("Incorrect username or password.")
+    
+    with col2:
+        if st.button("👤 Parent Profile", use_container_width=True):
+            st.switch_page("pages/parent-profile.py")
+    
+    with col3:
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
+    
+    with col4:
+        if st.button("🚪 Sign out", use_container_width=True):
+            logout_parent()
+else:
+    st.info("No students registered yet. Please register a student first.")
+    if st.button("Register Student"):
+        st.switch_page("pages/parent-login.py")
     st.stop()
 
 header_left, header_right = st.columns([4, 1])
-header_left.markdown("## Results library")
-header_left.caption("Review completed exams saved on this device.")
-if header_right.button("Sign out"):
-    st.session_state.parent_authenticated = False
-    st.rerun()
+header_left.markdown("## Student Results")
+header_left.caption(f"Review completed exams for {selected_student_display}.")
 
-if not DB_PATH.exists():
-    st.info("No exam results yet. Completed exams will appear here.")
+if st.button("▶️ Start a New Exam", type="primary"):
+    st.switch_page("learning-home.py")
+
+# Get filtered exam results for the selected student
+current_student_id = get_current_student()
+rows = get_exams_by_parent(parent["id"], current_student_id) if current_student_id else []
+
+if not rows:
+    st.info("No exam results yet for this student. Completed exams will appear here.")
     st.stop()
 
-connection = sqlite3.connect(DB_PATH)
-connection.row_factory = sqlite3.Row
-columns = {row["name"] for row in connection.execute("PRAGMA table_info(exams)")}
-if not columns:
-    # The database file exists but no exam has ever been stored yet.
-    connection.close()
-    st.info("No exam results yet. Completed exams will appear here.")
-    st.stop()
-if "school_district" not in columns:
-    connection.execute("ALTER TABLE exams ADD COLUMN school_district TEXT NOT NULL DEFAULT ''")
-if "school_state" not in columns:
-    connection.execute("ALTER TABLE exams ADD COLUMN school_state TEXT NOT NULL DEFAULT ''")
-if "topic" not in columns:
-    connection.execute("ALTER TABLE exams ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
-connection.commit()
-rows = connection.execute("SELECT * FROM exams ORDER BY end_time DESC").fetchall()
-connection.close()
-
+# Additional filters for the selected student. Country / State / Grade /
+# Subject / Topic default to the values configured in config.json so the
+# page opens on the same selections as the "Start a New Exam" form.
 with st.container(border=True):
     st.markdown("#### Filter results")
-    first, second, third, fourth = st.columns(4)
-    name_filter = first.text_input("Student name", placeholder="Search by name")
-    grades_list = load_grades(load_topics(), CONFIG)
-    grade_filter = second.selectbox("Grade", ["All grades"] + grades_list)
-    subject_filter = third.selectbox("Subject", ["All subjects"] + SUBJECT_CATALOG)
-    topic_source = [row for row in rows if (not name_filter or name_filter.lower() in row["student_name"].lower()) and (grade_filter == "All grades" or row["grade"] == grade_filter) and (subject_filter == "All subjects" or row["subject"] == subject_filter)]
-    topic_filter = fourth.selectbox("Topic", ["All topics"] + sorted({row["topic"] for row in topic_source if row["topic"]}))
+    first, second, third = st.columns(3)
+    fourth, fifth, sixth = st.columns(3)
 
-filtered = [row for row in topic_source if topic_filter == "All topics" or row["topic"] == topic_filter]
+    grades_list = load_grades(load_topics(), CONFIG)
+
+    default_country = DEFAULTS.get("country", COUNTRIES[0] if COUNTRIES else "United States")
+    country_index = COUNTRIES.index(default_country) if default_country in COUNTRIES else 0
+    country_filter = first.selectbox("Country", COUNTRIES, index=country_index)
+
+    country_states = LOCATIONS.get(country_filter, {}) if country_filter else {}
+    state_names = list(country_states.keys())
+    if state_names:
+        default_state = DEFAULTS.get("state", state_names[0])
+        state_options = ["All states"] + state_names
+        state_index = state_options.index(default_state) if default_state in state_options else 0
+        state_filter = second.selectbox("State", state_options, index=state_index)
+    else:
+        state_filter = "All states"
+        second.selectbox("State", ["All states"], index=0, disabled=True)
+
+        # Grade and Subject default to "All" so the page opens showing every result
+    # for the selected student.
+    grade_options = ["All grades"] + grades_list
+    grade_filter = third.selectbox("Grade", grade_options, index=0)
+
+    subject_options = ["All subjects"] + SUBJECT_CATALOG
+    subject_filter = fourth.selectbox("Subject", subject_options, index=0)
+
+    # Topic options come from the stored results so a filter can never select
+    # a topic with no rows.
+    topic_catalog = sorted({row.get("topic", "") for row in rows if row.get("topic")})
+    default_topic = DEFAULTS.get("topic") or ""
+    topic_options = ["All topics"] + topic_catalog
+    topic_index = topic_options.index(default_topic) if default_topic in topic_options else 0
+    topic_filter = fifth.selectbox("Topic", topic_options, index=topic_index)
+
+    # Apply filters
+    filtered = rows
+    if country_filter != "All countries":
+        filtered = [row for row in filtered if row.get("country") == country_filter]
+    if state_filter != "All states":
+        filtered = [row for row in filtered if row.get("school_state") == state_filter]
+    if grade_filter != "All grades":
+        filtered = [row for row in filtered if row["grade"] == grade_filter]
+    if subject_filter != "All subjects":
+        filtered = [row for row in filtered if row["subject"] == subject_filter]
+    if topic_filter != "All topics":
+        filtered = [row for row in filtered if row.get("topic") == topic_filter]
 
 if not filtered:
     st.info("No results match these filters.")
@@ -196,16 +203,14 @@ else:
             table_rows = "".join(
                 f"<tr><td>{index}</td><td>{escape(str(item['question']))}</td><td>{format_options(item.get('options'))}</td><td>{escape(str(item.get('student_answer') or 'Not answered'))}</td><td>{escape(str(item['answer']))}</td><td>{format_question_time(item.get('time_seconds', 0))}</td><td>{'Correct' if item.get('student_answer') == item['answer'] else 'Wrong'}</td></tr>"
                 for index, item in enumerate(review, 1)
-            )
+                        )
             st.markdown(
                 f'<table class="results-table"><thead><tr><th>#</th><th>Question</th><th>Options</th><th>Student answer</th><th>Correct answer</th><th>Time</th><th>Status</th></tr></thead><tbody>{table_rows}</tbody></table>',
                 unsafe_allow_html=True,
             )
             confirm_delete = st.checkbox("Confirm deletion", key=f"confirm_delete_{row['id']}")
             if st.button("Delete this test", key=f"delete_{row['id']}", disabled=not confirm_delete):
-                delete_connection = sqlite3.connect(DB_PATH)
-                delete_connection.execute("DELETE FROM exams WHERE id = ?", (row["id"],))
-                delete_connection.commit()
-                delete_connection.close()
+                storage.execute("DELETE FROM exams WHERE id = :id", {"id": row["id"]})
+                logger.info("Deleted exam id %s for student '%s'.", row["id"], row["student_name"])
                 st.success("Test deleted.")
                 st.rerun()

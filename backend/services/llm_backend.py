@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
-import streamlit as st
-from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).parent
+from backend.services import storage
+from app_settings import BASE_DIR, read_setting
+
 CONFIG_DIR = BASE_DIR / "config"
 
 
@@ -44,34 +42,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "appearance": "Dark",
     },
 }
-load_dotenv(BASE_DIR / ".env")
-
-
-def read_setting(name: str) -> str | None:
-    """Return a configured value from Streamlit secrets first, then the environment.
-
-    Locally the value comes from ``.env``; on Streamlit Community Cloud the same
-    value is pasted into the app's *Advanced settings -> Secrets* box, which is
-    exposed through ``st.secrets``. Secrets are matched case-insensitively
-    because provider keys are named in upper case (``GROQ_API_KEY``) while the
-    Parent Results credentials were historically written in lower case
-    (``parent_username``). Lookups never raise: a missing or malformed
-    secrets.toml simply means the value is not configured.
-    """
-    if not name:
-        return None
-    for candidate in (name, name.lower()):
-        try:
-            value = st.secrets.get(candidate)
-        except Exception:  # noqa: BLE001 - secrets.toml may be absent or unreadable
-            value = None
-        if value:
-            return str(value)
-    for candidate in (name, name.upper(), name.lower()):
-        value = os.getenv(candidate)
-        if value:
-            return value
-    return None
 
 
 def load_models() -> list[dict[str, Any]]:
@@ -432,14 +402,19 @@ def unique_questions(questions: list[dict[str, Any]], count: int) -> list[dict[s
     return unique[:count]
 
 
-def historical_mistakes(db_path: Path, student_name: str, grade: str, subject: str, topic: str) -> list[str]:
-    connection = sqlite3.connect(db_path)
-    connection.row_factory = sqlite3.Row
-    rows = connection.execute(
-        "SELECT questions_json FROM exams WHERE lower(student_name) = lower(?) AND grade = ? AND subject = ? AND topic = ? ORDER BY end_time DESC",
-        (student_name, grade, subject, topic),
-    ).fetchall()
-    connection.close()
+def historical_mistakes(student_name: str, grade: str, subject: str, topic: str) -> list[str]:
+    """Questions this student previously answered incorrectly for the same topic.
+
+    The query uses named bind parameters so it runs unchanged on SQLite and on a
+    hosted PostgreSQL database.
+    """
+    rows = storage.fetch_all(
+        "SELECT questions_json FROM exams"
+        " WHERE lower(student_name) = lower(:student_name)"
+        " AND grade = :grade AND subject = :subject AND topic = :topic"
+        " ORDER BY end_time DESC",
+        {"student_name": student_name, "grade": grade, "subject": subject, "topic": topic},
+    )
     mistakes: list[str] = []
     seen: set[str] = set()
     for row in rows:
@@ -509,8 +484,8 @@ def _request_text(model: dict[str, Any], prompt: str, temperature: float, max_to
     raise RuntimeError(f"Unsupported model provider: {provider}")
 
 
-def generate_questions(db_path: Path, model: dict[str, Any], subject: str, grade: str, count: int, school_state: str = "", school_district: str = "", topic: str = "", student_name: str = "", temperature: float = 0.3, include_visuals: bool = False) -> tuple[list[dict[str, Any]], str]:
-    mistakes = historical_mistakes(db_path, student_name, grade, subject, topic) if student_name else []
+def generate_questions(model: dict[str, Any], subject: str, grade: str, count: int, school_state: str = "", school_district: str = "", topic: str = "", student_name: str = "", temperature: float = 0.3, include_visuals: bool = False) -> tuple[list[dict[str, Any]], str]:
+    mistakes = historical_mistakes(student_name, grade, subject, topic) if student_name else []
     district_context = f" The student is in {school_state}, United States, and attends {school_district}. Align with this district's publicly available curriculum." if school_district else ""
     topic_context = f" The requested topic is {topic}." if topic else ""
     mistake_context = f" Prior incorrect questions to target are {mistakes}. Test the same skills with new wording, numbers, or contexts." if mistakes else ""

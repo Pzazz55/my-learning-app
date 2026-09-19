@@ -38,6 +38,8 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    Boolean,
+    ForeignKey,
     create_engine,
     event,
     inspect,
@@ -77,6 +79,8 @@ exams = Table(
     Column("school_district", Text, nullable=False, server_default=""),
     Column("topic", Text, nullable=False, server_default=""),
     Column("question_set_id", Integer),
+    Column("student_id", Integer, nullable=True),  # New column for student reference
+    Column("parent_id", Integer, nullable=True),   # New column for parent reference
 )
 
 question_sets = Table(
@@ -91,6 +95,60 @@ question_sets = Table(
     Column("created_at", Text, nullable=False),
 )
 
+# New tables for multi-student and authentication support
+parents = Table(
+    "parents",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("parent_name", Text, nullable=False),
+    Column("username", Text, nullable=False, unique=True),
+    Column("email", Text, nullable=False, unique=True),
+    Column("password_hash", Text, nullable=True),
+    Column("google_id", Text, nullable=True),
+    Column("auth_type", Text, nullable=False, default="manual"),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+)
+
+students = Table(
+    "students",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("student_id", Text, nullable=False, unique=True),
+    Column("student_name", Text, nullable=False),
+    Column("parent_id", Integer, ForeignKey("parents.id"), nullable=False),
+    Column("grade", Text, nullable=False),
+    Column("country", Text, nullable=False),
+    Column("school_state", Text, nullable=False, server_default=""),
+    Column("school_district", Text, nullable=False, server_default=""),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+)
+
+otp_codes = Table(
+    "otp_codes",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("parent_id", Integer, ForeignKey("parents.id"), nullable=False),
+    Column("code", Text, nullable=False),
+    Column("expires_at", Text, nullable=False),
+    Column("used", Boolean, nullable=False, default=False),
+    Column("created_at", Text, nullable=False),
+)
+
+email_queue = Table(
+    "email_queue",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("to_email", Text, nullable=False),
+    Column("subject", Text, nullable=False),
+    Column("body", Text, nullable=False),
+    Column("status", Text, nullable=False, default="pending"),
+    Column("created_at", Text, nullable=False),
+    Column("sent_at", Text, nullable=True),
+    Column("error_message", Text, nullable=True),
+)
+
 # Columns added after the first release. Databases created by an older version are
 # upgraded in place because SQLite and PostgreSQL share this ADD COLUMN syntax.
 EXAM_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
@@ -98,6 +156,8 @@ EXAM_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("school_state", "TEXT NOT NULL DEFAULT ''"),
     ("topic", "TEXT NOT NULL DEFAULT ''"),
     ("question_set_id", "INTEGER"),
+    ("student_id", "INTEGER"),
+    ("parent_id", "INTEGER"),
 )
 
 _lock = threading.RLock()
@@ -310,7 +370,9 @@ def ensure_schema() -> None:
                     school_state TEXT NOT NULL DEFAULT '',
                     school_district TEXT NOT NULL DEFAULT '',
                     topic TEXT NOT NULL DEFAULT '',
-                    question_set_id INTEGER
+                    question_set_id INTEGER,
+                    student_id INTEGER,
+                    parent_id INTEGER
                 )
             """)
             
@@ -326,11 +388,75 @@ def ensure_schema() -> None:
                 )
             """)
             
+            # Create new tables for multi-student support
+            _turso_execute("""
+                CREATE TABLE IF NOT EXISTS parents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_name TEXT NOT NULL,
+                    username TEXT NOT NULL UNIQUE,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT,
+                    google_id TEXT,
+                    auth_type TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            
+            _turso_execute("""
+                CREATE TABLE IF NOT EXISTS students (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    student_id TEXT NOT NULL UNIQUE,
+                    student_name TEXT NOT NULL,
+                    parent_id INTEGER NOT NULL,
+                    grade TEXT NOT NULL,
+                    country TEXT NOT NULL,
+                    school_state TEXT NOT NULL DEFAULT '',
+                    school_district TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (parent_id) REFERENCES parents(id)
+                )
+            """)
+            
+            _turso_execute("""
+                CREATE TABLE IF NOT EXISTS otp_codes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id INTEGER NOT NULL,
+                    code TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (parent_id) REFERENCES parents(id)
+                )
+            """)
+            
+            _turso_execute("""
+                CREATE TABLE IF NOT EXISTS email_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    to_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    sent_at TEXT,
+                    error_message TEXT
+                )
+            """)
+            
             _upgrade_exam_columns(None)  # Pass None since we're using HTTP client directly
         else:
             engine = get_engine()
             metadata.create_all(engine)
             _upgrade_exam_columns(engine)
+            
+            # Create indexes for new tables
+            with engine.begin() as connection:
+                connection.execute(text("CREATE INDEX IF NOT EXISTS idx_students_parent_id ON students(parent_id)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS idx_exams_student_id ON exams(student_id)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS idx_exams_parent_id ON exams(parent_id)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS idx_otp_codes_parent_id ON otp_codes(parent_id)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS idx_email_queue_status ON email_queue(status)"))
         
         _schema_ready = True
 
@@ -359,6 +485,12 @@ def fetch_all(sql: str, params: Mapping[str, Any] | None = None) -> list[dict[st
     with get_engine().connect() as connection:
         result = connection.execute(text(sql), dict(params or {}))
         return [dict(row._mapping) for row in result]
+
+
+def fetch_one(sql: str, params: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    """Run a read statement and return the first row as a dictionary, or None."""
+    rows = fetch_all(sql, params)
+    return rows[0] if rows else None
 
 
 def execute(sql: str, params: Mapping[str, Any] | None = None) -> int | None:

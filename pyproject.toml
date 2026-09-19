@@ -10,14 +10,13 @@ requires-python = ">=3.12"
 dependencies = [
     "python-dotenv>=1.0.1",
     "requests>=2.31.0",
+    "sqlalchemy>=2.0.36",
+    "psycopg[binary]>=3.2.3",
     "streamlit>=1.64.0",
     "streamlit-autorefresh>=1.0.1",
     "tzdata>=2024.1",
+    "google-auth>=2.23.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-api-python-client>=2.100.0",
+    "libsql-client>=0.3.0",
 ]
-
-[project.scripts]
-my-learning-app = "my_learning_app:main"
-
-[build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"

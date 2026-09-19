@@ -136,9 +136,15 @@ def submit_exam() -> None:
         return
     st.session_state.exam_submitted = True
 
+    exam = st.session_state.get("exam")
+    if not exam:
+        # Nothing to grade (e.g. the exam state was cleared). Make sure the
+        # result screen has something to show instead of raising a KeyError.
+        st.session_state.result = st.session_state.get("result") or {}
+        return
+
     record_current_question_time()
-    exam = st.session_state.exam
-    answers = st.session_state.answers
+    answers = st.session_state.get("answers", {})
     correct = sum(answers.get(index) == question["answer"] for index, question in enumerate(exam["questions"]))
     ended = datetime.now(timezone.utc)
     record = {
@@ -198,7 +204,16 @@ def submit_exam() -> None:
 
 
 def show_result() -> None:
-    result = st.session_state.result
+    result = st.session_state.get("result")
+    if not result:
+        # The result was never written (or the state was cleared). Don't crash
+        # on the completion screen - reset and send the parent back to setup.
+        st.warning("Your exam has ended, but the result could not be loaded. Please start a new exam.")
+        if st.button("Back to setup", type="primary"):
+            reset_exam()
+            st.session_state.pop("result", None)
+            st.rerun()
+        return
     if not st.session_state.get("celebration_shown", False):
         st.balloons()
         st.session_state.celebration_shown = True
@@ -222,6 +237,7 @@ def show_result() -> None:
         st.markdown(f"**{index}. {item['question']}**  \nYour answer: {student_answer} · Correct answer: {item['answer']} · Time: {format_duration(item.get('time_seconds', 0))} · **{status}**")
     if st.button("Start another exam", type="primary"):
         reset_exam()
+        st.session_state.pop("result", None)
         st.rerun()
 
 
@@ -389,9 +405,14 @@ def show_setup() -> None:
 
 
 def show_exam() -> None:
-    exam = st.session_state.exam
     if st.session_state.get("exam_submitted"):
+        # The exam is finished: stop the 1-second refresher and show the result.
         show_result()
+        return
+    exam = st.session_state.get("exam")
+    if not exam:
+        # No exam in progress; fall back to the setup screen.
+        show_setup()
         return
     st_autorefresh(interval=1000, key="exam_clock")
     current = st.session_state.current_question
@@ -502,7 +523,10 @@ if not is_parent_authenticated():
 
 logger.info("Rendering student workspace for parent '%s'.", (get_current_parent() or {}).get("username"))
 
-if "exam" not in st.session_state:
-    show_setup()
-else:
+if st.session_state.get("exam_submitted"):
+    # Exam finished: show the result (show_result handles a missing result).
+    show_result()
+elif "exam" in st.session_state:
     show_exam()
+else:
+    show_setup()

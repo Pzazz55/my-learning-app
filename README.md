@@ -13,50 +13,39 @@ streamlit run learning-home.py
 
 The app uses SQLite in `education_app.db`, created automatically on first run. The first screen is the **Parent Login / Sign-Up** page; after signing in you can start exams, review **Student Results** and edit the **Parent Profile** from the in-app buttons.
 
-### Manual Database Creation
+The database schema is created automatically on first launch (new tables and
+columns are added in place on older databases). It includes:
 
-If you prefer to create the database manually before running the app, use the provided scripts:
-
-**Windows:**
-```powershell
-.\init_database.bat
-```
-
-**Unix/Linux/macOS:**
-```bash
-chmod +x init_database.sh
-./init_database.sh
-```
-
-**Or manually with SQLite:**
-```bash
-sqlite3 education_app.db < create_database.sql
-```
-
-The database schema includes:
-- `exams` table: Stores completed exam results with student details, scores, and question data
-- `question_sets` table: Stores generated question sets for reusability
-- Performance indexes on commonly queried columns
+- `exams` table: completed exam results with student details, scores and question data
+- `question_sets` table: generated question sets, kept for reuse
+- `parents` / `students` tables: accounts and the one-to-many parent → children relationship
+- `otp_codes` / `email_queue` tables: password-reset codes and outbound email
+- Performance indexes on the commonly queried columns
 
 ## Project structure
 
 | Path | Purpose |
 | --- | --- |
 | `learning-home.py` | App entry point — requires parent login, then setup form, timed exam, celebration screen |
-| `pages/parent-login.py` | First screen: Parent Sign In (with Google OAuth + password reset) and Sign Up in one page |
+| `pages/parent-login.py` | First screen: Parent Sign In (with Google OAuth + password reset) and Sign Up (multi-child) in one page |
 | `pages/student-results.py` | Student Results page (student selector, filters, answer review, delete) |
-| `pages/parent-profile.py` | Parent Profile — view/edit the parent and student profile |
+| `pages/parent-profile.py` | Parent Profile — view/edit the parent details and add/remove/edit children |
+| `app_settings.py` | Reads configuration from Streamlit secrets first, then the environment |
+| `backend/services/llm_backend.py` | Config loading, subject/topic resolution, provider routing, question generation |
+| `backend/services/storage.py` | Database layer with support for SQLite, Turso (libsql), and PostgreSQL |
+| `backend/services/auth_storage.py` | Parent/student account persistence and exam linking |
+| `backend/services/email_service.py` | Outbound email (exam reports, OTP reset codes) |
+| `backend/services/google_auth.py` | Google OAuth sign-in |
 | `backend/services/logging_config.py` | Shared logging setup; writes rotating logs to `logs/app.log` |
-| `llm_backend.py` | Config loading, subject/topic resolution, provider routing, question generation |
-| `storage.py` | Database layer with support for SQLite, Turso (libsql), and PostgreSQL |
+| `ui/components/theme.py` | Light/Dark CSS for the workspace and parent pages |
+| `ui/components/appearance.py` | Shared Light/Dark appearance toggle |
+| `middleware/` | Parent authentication / session middleware |
 | `config/` | `config.json`, `locations.json`, `topics.json`, `models.json` |
+| `tests/` | Pytest unit and integration test suites |
 | `logs/` | Runtime log output (`app.log`); contents are git-ignored |
 | `requirements.txt` | Runtime dependencies installed by Streamlit Community Cloud |
-| `_verify_changes.py` | End-to-end check driven by `streamlit.testing.v1.AppTest` |
+| `runtime.txt` | Python version used by Streamlit Community Cloud |
 | `.streamlit/secrets.toml.example` | Template for the secrets to paste into Community Cloud |
-| `create_database.sql` | SQL script for manual database creation |
-| `init_database.bat` | Windows script to initialize the database |
-| `init_database.sh` | Unix script to initialize the database |
 
 ## Deploy to Streamlit Community Cloud
 
@@ -84,7 +73,7 @@ There is no build step: Community Cloud installs `requirements.txt` and runs the
    | Branch | `master` |
    | Main file path | `learning-home.py` |
 
-4. Click **Advanced settings**, set **Python version** to `3.12`, and paste your secrets into the **Secrets** box. Start from `.streamlit/secrets.toml.example`:
+4. Click **Advanced settings**. The repository ships a `runtime.txt` pinning Python `3.12`, which Community Cloud picks up automatically; if the UI shows a Python version selector, choose `3.12` to match. Then paste your secrets into the **Secrets** box, starting from `.streamlit/secrets.toml.example`:
 
    ```toml
    GROQ_API_KEY = "..."

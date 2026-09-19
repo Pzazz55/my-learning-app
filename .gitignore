@@ -5,6 +5,7 @@ __pycache__/
 education_app.db
 .streamlit/secrets.toml
 .vscode/
+.continue/
 .pytest_cache/
 build/
 dist/

@@ -78,8 +78,8 @@ exams = Table(
     Column("school_state", Text, nullable=False, server_default=""),
     Column("school_district", Text, nullable=False, server_default=""),
     Column("topic", Text, nullable=False, server_default=""),
-    Column("question_set_id", Integer),
-    Column("student_id", Integer, nullable=True),  # New column for student reference
+        Column("question_set_id", Integer),
+    Column("student_id", Text, nullable=True),  # Public student id (e.g. "STU-001")
     Column("parent_id", Integer, nullable=True),   # New column for parent reference
 )
 
@@ -155,8 +155,8 @@ EXAM_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("school_district", "TEXT NOT NULL DEFAULT ''"),
     ("school_state", "TEXT NOT NULL DEFAULT ''"),
     ("topic", "TEXT NOT NULL DEFAULT ''"),
-    ("question_set_id", "INTEGER"),
-    ("student_id", "INTEGER"),
+        ("question_set_id", "INTEGER"),
+    ("student_id", "TEXT"),
     ("parent_id", "INTEGER"),
 )
 
@@ -264,7 +264,7 @@ def _turso_execute(sql: str, params: list[Any] | None = None) -> Any:
     if isinstance(result, list):
         # Turso returns a list of statement results
         if len(result) > 0 and result[0].get("error"):
-            raise RuntimeError(f"Turso query error: {result[0]['error']}")
+                        raise RuntimeError(f"Turso query error: {result[0]['error']}")
         # Extract the actual results from the first statement
         if len(result) > 0 and result[0].get("results"):
             return {"results": [result[0]["results"]]}
@@ -275,6 +275,60 @@ def _turso_execute(sql: str, params: list[Any] | None = None) -> Any:
         return result
     
     return result
+
+
+def _turso_execute_statements(statements: list[dict[str, Any]]) -> Any:
+    """Execute several statements in one Turso HTTP request.
+
+    All statements run on the same server-side connection, so a statement like
+    ``SELECT last_insert_rowid()`` can read the row written by a preceding
+    ``INSERT`` in the same batch. ``_turso_execute`` exists for single-statement
+    calls; this helper keeps multi-statement work in one round-trip.
+    """
+    http_url, auth_token = _get_turso_http_client()
+
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+    }
+
+    response = requests.post(http_url, headers=headers, json={"statements": statements}, timeout=30)
+    response.raise_for_status()
+
+    result = response.json()
+
+    # Normalise the various Turso response shapes to {"results": [...]}.
+    if isinstance(result, list):
+        for entry in result:
+            if isinstance(entry, dict) and entry.get("error"):
+                raise RuntimeError(f"Turso query error: {entry['error']}")
+        return {"results": result}
+    if isinstance(result, dict):
+        return result
+    return result
+
+
+def _extract_turso_scalar(result: Any) -> int | None:
+    """Return the first cell of the first row of a Turso response, or None.
+
+    Used to read the id returned by the batched ``SELECT last_insert_rowid()``.
+    Walks the ``{"results": [{"rows": [[...]]}]}`` structure without assuming a
+    single exact shape, since the HTTP API has changed its envelope over time.
+    """
+    if not isinstance(result, dict):
+        return None
+    results = result.get("results")
+    if not isinstance(results, list):
+        return None
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        rows = entry.get("rows")
+        if rows and isinstance(rows, list) and rows[0] and len(rows[0]) > 0:
+            value = rows[0][0]
+            if value is not None:
+                return int(value)
+    return None
 
 
 def get_engine() -> Engine | None:
@@ -370,8 +424,8 @@ def ensure_schema() -> None:
                     school_state TEXT NOT NULL DEFAULT '',
                     school_district TEXT NOT NULL DEFAULT '',
                     topic TEXT NOT NULL DEFAULT '',
-                    question_set_id INTEGER,
-                    student_id INTEGER,
+                                        question_set_id INTEGER,
+                    student_id TEXT,
                     parent_id INTEGER
                 )
             """)
@@ -496,29 +550,52 @@ def fetch_one(sql: str, params: Mapping[str, Any] | None = None) -> dict[str, An
 def execute(sql: str, params: Mapping[str, Any] | None = None) -> int | None:
     """Run a write statement.
 
-    Returns the first column of the first returned row when the statement ends
-    with ``RETURNING`` (used to read a new row's ``id``), otherwise ``None``.
+    When the statement is an ``INSERT``, the new row's ``id`` is returned;
+    otherwise ``None``. The id is obtained in the *same* round-trip as the write
+    so it works on every backend. This matters on the stateless Turso HTTP API,
+    where a later ``SELECT last_insert_rowid()`` would run on a different
+    connection and always return 0.
     """
     ensure_schema()
-    
+
+    params = dict(params or {})
+    is_insert = sql.lstrip().upper().startswith("INSERT")
+
     if is_turso():
-        # Convert named parameters to positional for Turso HTTP API
+        # Convert named parameters to positional for the Turso HTTP API.
         import re
         param_names = re.findall(r':(\w+)', sql)
         sql_str = re.sub(r':\w+', '?', sql)
-        param_list = [params.get(name) for name in param_names] if params else []
-        
-        result = _turso_execute(sql_str, param_list)
-        
-        # Check if this is a RETURNING query
-        if "RETURNING" in sql.upper():
-            if result and result.get("results") and result["results"][0].get("rows"):
-                return int(result["results"][0]["rows"][0][0]) if result["results"][0]["rows"][0][0] is not None else None
+        param_list = [params.get(name) for name in param_names]
+
+        if is_insert:
+            # Batch the INSERT and the id lookup into one request so
+            # last_insert_rowid() runs on the same connection as the write.
+            statements = [
+                {"q": sql_str, "params": param_list},
+                {"q": "SELECT last_insert_rowid()", "params": []},
+            ]
+            result = _turso_execute_statements(statements)
+            return _extract_turso_scalar(result)
+
+        _turso_execute(sql_str, param_list)
         return None
-    
+
     with get_engine().begin() as connection:
-        result = connection.execute(text(sql), dict(params or {}))
+        if is_insert and get_engine().dialect.name == "postgresql":
+            # PostgreSQL has no last_insert_rowid(); RETURNING id is the
+            # reliable way to read the new key on the shared connection.
+            result = connection.execute(text(f"{sql} RETURNING id"), params)
+            row = result.first()
+            return int(row[0]) if row is not None and row[0] is not None else None
+
+        result = connection.execute(text(sql), params)
         if not result.returns_rows:
+            if is_insert:
+                # SQLite exposes the rowid of the just-inserted row on the same
+                # connection used for the write.
+                row = connection.execute(text("SELECT last_insert_rowid()")).first()
+                return int(row[0]) if row is not None and row[0] is not None else None
             return None
         row = result.first()
         return int(row[0]) if row is not None else None

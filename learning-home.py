@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import random
@@ -12,7 +12,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from backend.services import storage
 from backend.services.llm_backend import DEFAULT_SUBJECTS, describe_topic_source, generate_questions as generate_questions_from_backend, load_config, load_grades, load_locations, load_models, load_topics, resolve_subjects, resolve_topics
-from backend.services.auth_storage import get_students_by_parent, link_exam_to_student_parent
+from backend.services.auth_storage import get_students_by_parent
 from backend.services.email_service import send_exam_report_email
 from backend.services.logging_config import get_logger
 from middleware import (
@@ -44,7 +44,7 @@ VISUALS_BY_SUBJECT = {
     "Others": ("https://images.unsplash.com/photo-1516321318423-f06f85e504b3?auto=format&fit=crop&w=1200&q=80", "Learning and discovery"),
 }
 
-st.set_page_config(page_title="Study Sprint", page_icon="✦", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Study Sprint", page_icon="*", layout="wide", initial_sidebar_state="collapsed")
 
 
 def inject_styles(theme: str) -> None:
@@ -112,34 +112,25 @@ def format_duration(seconds: float) -> str:
 
 @st.fragment(run_every="1s")
 def render_clock() -> None:
-    """Show the current time in the timezone configured in config.json.
-
-    The clock lives in its own fragment so only the clock redraws each second,
-    and ``%Z`` reports the real abbreviation for the moment shown - EST/EDT for
-    America/New_York, GMT/BST for Europe/London, IST for Asia/Kolkata, and so
-    on, including that zone's daylight saving rules.
-    """
+    """Show the current time in the timezone configured in config.json."""
     now = datetime.now(CONFIG["zone"])
     st.markdown(
         f'<div class="clock"><div class="clock-time">{now.strftime("%I:%M:%S %p").lstrip("0")}</div>'
-        f'<div class="clock-zone">{now.strftime("%Z")} · {escape(str(CONFIG["timezone_label"]))}</div>'
+        f'<div class="clock-zone">{now.strftime("%Z")} - {escape(str(CONFIG["timezone_label"]))}</div>'
         f'<div class="clock-date">{now.strftime("%a %d %b %Y")}</div></div>',
         unsafe_allow_html=True,
     )
 
 
 def submit_exam() -> None:
-    # Prevent multiple submissions. The flag is set *before* any database work
-    # so a second call in the same or a racing run (autorefresh tick, double
-    # click, or the timeout branch) can never insert a duplicate exam row.
+    # Prevent multiple submissions. The flag is set before any database work
+    # so a second call in the same or a racing run can never insert a duplicate.
     if st.session_state.get("exam_submitted"):
         return
     st.session_state.exam_submitted = True
 
     exam = st.session_state.get("exam")
     if not exam:
-        # Nothing to grade (e.g. the exam state was cleared). Make sure the
-        # result screen has something to show instead of raising a KeyError.
         st.session_state.result = st.session_state.get("result") or {}
         return
 
@@ -154,60 +145,62 @@ def submit_exam() -> None:
         "wrong_count": len(exam["questions"]) - correct,
         "questions_json": json.dumps([{**question, "student_answer": answers.get(index), "time_seconds": round(st.session_state.question_times.get(index, 0.0), 1)} for index, question in enumerate(exam["questions"])]),
     }
-    exam_id = storage.execute(
-        "INSERT INTO exams (student_name, grade, country, school_state, school_district, subject, topic, question_set_id, question_count, time_limit, start_time, end_time, score, correct_count, wrong_count, questions_json)"
-        " VALUES (:student_name, :grade, :country, :school_state, :school_district, :subject, :topic, :question_set_id, :question_count, :time_limit, :start_time, :end_time, :score, :correct_count, :wrong_count, :questions_json) RETURNING id",
-        record,
-    )
-    
-    if exam_id is None:
-        # Fallback for databases that don't support RETURNING
-        exam_id = int(storage.execute("SELECT last_insert_rowid()") or 0)
-    
-    # Link exam to student and parent if authenticated
+
+    # Resolve the owning student/parent once, preferring the id captured when the
+    # exam was created. Falling back to session state means a hibernated or
+    # refreshed session still links the exam instead of leaving student_id NULL.
     parent = get_current_parent()
-    current_student_id = get_current_student()
-    if parent and current_student_id:
+    student_id_value = exam.get("student_id") or get_current_student()
+    parent_id_value = parent["id"] if parent else None
+    # exams.student_id stores the public student id (a string such as "STU-001"),
+    # matching how student-results filters exams, so it is stored verbatim.
+    record["student_id"] = str(student_id_value) if student_id_value else None
+    record["parent_id"] = int(parent_id_value) if parent_id_value else None
+
+    # The result is written to session state before any database work so the
+    # completion screen always has something to show.
+    st.session_state.result = record
+
+    try:
+        storage.execute(
+            "INSERT INTO exams (student_name, student_id, parent_id, grade, country, school_state, school_district, subject, topic, question_set_id, question_count, time_limit, start_time, end_time, score, correct_count, wrong_count, questions_json)"
+            " VALUES (:student_name, :student_id, :parent_id, :grade, :country, :school_state, :school_district, :subject, :topic, :question_set_id, :question_count, :time_limit, :start_time, :end_time, :score, :correct_count, :wrong_count, :questions_json)",
+            record,
+        )
+    except Exception as db_error:
+        logger.error("Failed to persist exam for '%s': %s", record["student_name"], db_error)
+
+    if student_id_value and parent:
         try:
-            link_exam_to_student_parent(exam_id, current_student_id, parent["id"])
-            
-            # Send email report to parent
-            try:
-                from backend.services.auth_storage import get_student_by_id
-                student = get_student_by_id(current_student_id)
-                if student:
-                    login_url = "http://localhost:8501"  # Streamlit serves parent-login.py at the app root
-                    send_exam_report_email(
-                        to_email=parent["email"],
-                        student_name=student["student_name"],
-                        subject=exam["subject"],
-                        score=record["score"],
-                        correct_count=record["correct_count"],
-                        wrong_count=record["wrong_count"],
-                        total_questions=record["question_count"],
-                        exam_date=ended.strftime("%B %d, %Y at %I:%M %p"),
-                        parent_name=parent["parent_name"],
-                        login_url=login_url
-                    )
-            except Exception as email_error:
-                # Log email error but don't fail the exam submission
-                logger.warning("Failed to send email report: %s", email_error)
-        except Exception as link_error:
-            logger.warning("Failed to link exam to student/parent: %s", link_error)
-    
+            from backend.services.auth_storage import get_student_by_id
+            student = get_student_by_id(student_id_value)
+            if student:
+                login_url = "http://localhost:8501"
+                send_exam_report_email(
+                    to_email=parent["email"],
+                    student_name=student["student_name"],
+                    subject=exam["subject"],
+                    score=record["score"],
+                    correct_count=record["correct_count"],
+                    wrong_count=record["wrong_count"],
+                    total_questions=record["question_count"],
+                    exam_date=ended.strftime("%B %d, %Y at %I:%M %p"),
+                    parent_name=parent["parent_name"],
+                    login_url=login_url
+                )
+        except Exception as email_error:
+            logger.warning("Failed to send email report: %s", email_error)
+
     logger.info(
         "Exam submitted: student='%s' subject='%s' score=%s%% (%s/%s correct).",
-                record["student_name"], record["subject"], record["score"],
+        record["student_name"], record["subject"], record["score"],
         record["correct_count"], record["question_count"],
     )
-    st.session_state.result = record
 
 
 def show_result() -> None:
     result = st.session_state.get("result")
     if not result:
-        # The result was never written (or the state was cleared). Don't crash
-        # on the completion screen - reset and send the parent back to setup.
         st.warning("Your exam has ended, but the result could not be loaded. Please start a new exam.")
         if st.button("Back to setup", type="primary"):
             reset_exam()
@@ -221,7 +214,7 @@ def show_result() -> None:
     brand_left.markdown('<div class="eyebrow">Exam complete</div>', unsafe_allow_html=True)
     with brand_right:
         render_clock()
-    st.markdown('<div class="celebration">🎉 Amazing work! ⭐ You made it to the finish line! 🎈</div>', unsafe_allow_html=True)
+    st.markdown('<div class="celebration">Amazing work! You made it to the finish line!</div>', unsafe_allow_html=True)
     st.title("You did it!")
     st.markdown(f'<div class="success-box"><strong>{result["student_name"]}</strong>, your result has been saved for parent review.</div>', unsafe_allow_html=True)
     st.write("")
@@ -234,7 +227,7 @@ def show_result() -> None:
     for index, item in enumerate(json.loads(result["questions_json"]), start=1):
         student_answer = item.get("student_answer") or "Not answered"
         status = "Correct" if student_answer == item["answer"] else "Wrong"
-        st.markdown(f"**{index}. {item['question']}**  \nYour answer: {student_answer} · Correct answer: {item['answer']} · Time: {format_duration(item.get('time_seconds', 0))} · **{status}**")
+        st.markdown(f"**{index}. {item['question']}**  \nYour answer: {student_answer} - Correct answer: {item['answer']} - Time: {format_duration(item.get('time_seconds', 0))} - **{status}**")
     if st.button("Start another exam", type="primary"):
         reset_exam()
         st.session_state.pop("result", None)
@@ -242,7 +235,6 @@ def show_result() -> None:
 
 
 def option_index(options: list[Any], preferred: Any, fallback: int = 0) -> int:
-    """Index of the configured default value, or a fallback when it is absent."""
     try:
         return options.index(preferred)
     except ValueError:
@@ -250,7 +242,6 @@ def option_index(options: list[Any], preferred: Any, fallback: int = 0) -> int:
 
 
 def whole_number(value: Any, fallback: int) -> int:
-    """Coerce a config value to an int, falling back when it is not a number."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -258,36 +249,31 @@ def whole_number(value: Any, fallback: int) -> int:
 
 
 def show_setup() -> None:
-    # Check if parent is authenticated and has students
     parent = get_current_parent()
     students = get_students_by_parent(parent["id"]) if parent else []
-    
+
     brand_left, brand_right = st.columns([3, 1])
-    brand_left.markdown('<div class="brand"><div class="brand-mark">study<span>·</span>sprint</div><div class="pill">Student workspace</div></div>', unsafe_allow_html=True)
+    brand_left.markdown('<div class="brand"><div class="brand-mark">study<span>-</span>sprint</div><div class="pill">Student workspace</div></div>', unsafe_allow_html=True)
     with brand_right:
         render_clock()
 
-    # Parent navigation to the other authenticated screens.
     nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 1])
     with nav_col1:
-        if st.button("📊 Student Results", use_container_width=True):
+        if st.button("Student Results", use_container_width=True):
             st.switch_page("pages/student-results.py")
     with nav_col2:
-        if st.button("👤 Parent Profile", use_container_width=True):
+        if st.button("Parent Profile", use_container_width=True):
             st.switch_page("pages/parent-profile.py")
     with nav_col3:
-        if st.button("🚪 Sign out", use_container_width=True):
+        if st.button("Sign out", use_container_width=True):
             logout_parent()
-    
-        # Student selection for authenticated parents. Only this parent's children
-    # are listed, and the selection is kept in sync with the session.
+
+    selected_student_id: str | None = None
     if students:
         st.markdown("### Select Student")
         student_options = {f"{s['student_name']} ({s['student_id']})": s for s in students}
         current_student_id = get_current_student()
 
-        # Fall back to the first child when nothing is selected or the stored
-        # id is not one of this parent's children.
         if current_student_id not in {s['student_id'] for s in students}:
             current_student_id = students[0]['student_id']
             set_current_student(current_student_id)
@@ -305,8 +291,10 @@ def show_setup() -> None:
         selected_student = student_options[selected_student_display]
         if selected_student['student_id'] != current_student_id:
             set_current_student(selected_student['student_id'])
+        # Record the chosen student so the exam can be linked even if the
+        # session state (current_student_id) is lost before submission.
+        selected_student_id = selected_student['student_id']
 
-        # Pre-fill form with student data
         default_name = selected_student['student_name']
         default_grade = selected_student['grade']
         default_country = selected_student['country']
@@ -315,13 +303,12 @@ def show_setup() -> None:
 
         st.markdown("---")
     else:
-        # Set defaults from configuration
         default_name = ""
         default_grade = DEFAULTS["grade"]
         default_country = DEFAULTS["country"]
         default_state = DEFAULTS["state"]
         default_district = DEFAULTS["school_district"]
-    
+
     st.markdown('<div class="hero"><div class="eyebrow">Small steps, sharp thinking</div><h1>Your next best answer starts here.</h1><p>Build confidence with a focused, grade-aware quiz. Your progress is saved automatically so you can review it later.</p></div>', unsafe_allow_html=True)
     st.write("")
     country = st.selectbox("Country", COUNTRIES, index=option_index(COUNTRIES, default_country))
@@ -359,8 +346,6 @@ def show_setup() -> None:
     practice_mode = st.toggle("Practice mode", value=bool(DEFAULTS["practice_mode"]), help="Shows the correct answer after each question and moves forward only.")
     with st.form("exam_setup"):
         first, second = st.columns(2)
-        # The student is already chosen in the "Select Student" dropdown above,
-        # so the name field is only shown when there is no linked student.
         if students:
             name = default_name
             st.markdown(f"**Student:** {default_name}")
@@ -368,7 +353,7 @@ def show_setup() -> None:
             name = first.text_input("Student name", value=default_name, placeholder="e.g. Alex Morgan")
         count = first.selectbox("Number of questions", QUESTION_COUNTS, index=option_index(QUESTION_COUNTS, whole_number(DEFAULTS["question_count"], QUESTION_COUNTS[0])))
         minutes = second.number_input("Time limit (minutes)", min_value=1, max_value=180, value=min(180, max(1, whole_number(DEFAULTS["time_limit"], 10))), step=1)
-        submitted = st.form_submit_button("Start exam →", use_container_width=True)
+        submitted = st.form_submit_button("Start exam", use_container_width=True)
     if submitted:
         if not str(name).strip():
             st.error("Please enter a student name to begin.")
@@ -394,7 +379,7 @@ def show_setup() -> None:
                 return
         questions = attach_visuals(questions, subject, topic_value, include_images)
         question_set_id = save_question_set(str(name).strip(), grade, subject, topic_value, questions)
-        st.session_state.exam = {"student_name": str(name).strip(), "grade": grade, "country": country, "school_state": school_state, "school_district": school_district, "subject": subject, "topic": topic_value, "include_images": include_images, "practice_mode": practice_mode, "question_set_id": question_set_id, "time_limit": int(minutes), "questions": questions, "start_time": datetime.now(timezone.utc).isoformat(), "deadline": time.time() + int(minutes) * 60, "source": source}
+        st.session_state.exam = {"student_name": str(name).strip(), "student_id": selected_student_id, "grade": grade, "country": country, "school_state": school_state, "school_district": school_district, "subject": subject, "topic": topic_value, "include_images": include_images, "practice_mode": practice_mode, "question_set_id": question_set_id, "time_limit": int(minutes), "questions": questions, "start_time": datetime.now(timezone.utc).isoformat(), "deadline": time.time() + int(minutes) * 60, "source": source}
         st.session_state.answers = {}
         st.session_state.question_times = {}
         st.session_state.question_started_at = None
@@ -406,12 +391,10 @@ def show_setup() -> None:
 
 def show_exam() -> None:
     if st.session_state.get("exam_submitted"):
-        # The exam is finished: stop the 1-second refresher and show the result.
         show_result()
         return
     exam = st.session_state.get("exam")
     if not exam:
-        # No exam in progress; fall back to the setup screen.
         show_setup()
         return
     st_autorefresh(interval=1000, key="exam_clock")
@@ -430,8 +413,8 @@ def show_exam() -> None:
     question = exam["questions"][current]
     minutes, seconds = divmod(seconds_left, 60)
     top_left, top_right = st.columns([3, 1])
-    exam_details = " · ".join(escape(str(value)) for value in (exam["student_name"], exam["grade"], exam["subject"], exam["topic"]) if value)
-    top_left.markdown(f'<div class="brand"><div class="brand-mark">study<span>·</span>sprint</div><div class="pill">{exam_details}</div></div>', unsafe_allow_html=True)
+    exam_details = " - ".join(escape(str(value)) for value in (exam["student_name"], exam["grade"], exam["subject"], exam["topic"]) if value)
+    top_left.markdown(f'<div class="brand"><div class="brand-mark">study<span>-</span>sprint</div><div class="pill">{exam_details}</div></div>', unsafe_allow_html=True)
     with top_right:
         render_clock()
         st.markdown(f'<div class="timer">{minutes:02d}:{seconds:02d}</div><div class="timer-label">remaining</div>', unsafe_allow_html=True)
@@ -451,14 +434,14 @@ def show_exam() -> None:
     st.markdown('</div>', unsafe_allow_html=True)
     st.write("")
     left, middle, right = st.columns([1, 1, 1])
-    if current > 0 and not exam.get("practice_mode") and left.button("← Previous", use_container_width=True):
+    if current > 0 and not exam.get("practice_mode") and left.button("Previous", use_container_width=True):
         record_current_question_time()
         st.session_state.answers[current] = selected
         st.session_state.current_question -= 1
         st.session_state.question_started_at = time.time()
         st.rerun()
     if exam.get("practice_mode"):
-        action_label = "Finish exam" if current == len(exam["questions"]) - 1 and feedback_shown else "Continue →" if feedback_shown else "Check answer"
+        action_label = "Finish exam" if current == len(exam["questions"]) - 1 and feedback_shown else "Continue" if feedback_shown else "Check answer"
         if middle.button(action_label, type="primary", use_container_width=True):
             if not selected:
                 st.warning("Choose an answer before continuing.")
@@ -476,13 +459,12 @@ def show_exam() -> None:
                 record_current_question_time()
                 submit_exam()
                 st.rerun()
-    elif current < len(exam["questions"]) - 1 and middle.button("Next →", type="primary", use_container_width=True):
+    elif current < len(exam["questions"]) - 1 and middle.button("Next", type="primary", use_container_width=True):
         record_current_question_time()
         st.session_state.answers[current] = selected
         st.session_state.current_question += 1
         st.session_state.question_started_at = time.time()
         st.rerun()
-    # Only show submit button if exam is not already submitted
     if not exam.get("practice_mode") and current == len(exam["questions"]) - 1 and not st.session_state.get("exam_submitted") and right.button("Submit exam", type="primary", use_container_width=True):
         record_current_question_time()
         st.session_state.answers[current] = selected
@@ -492,11 +474,6 @@ def show_exam() -> None:
 
 
 def show_login_gate() -> None:
-    """Redirect unauthenticated visitors to the Parent Login page.
-
-    The whole app is parent-gated, so when no parent is authenticated the
-    student workspace is replaced with the Parent Login / Sign-Up page.
-    """
     st.session_state.setdefault("redirect_after_auth", "home")
     st.switch_page("pages/parent-login.py")
 
@@ -514,8 +491,6 @@ temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, val
 storage.ensure_schema()
 inject_styles(theme)
 
-# Every screen in the app is parent-gated. When no parent is signed in we
-# redirect to the Parent Login / Sign-Up page and hide the multipage nav.
 if not is_parent_authenticated():
     st.session_state.redirect_after_auth = "home"
     logger.info("Unauthenticated visit to learning-home; redirecting to login.")
@@ -524,7 +499,6 @@ if not is_parent_authenticated():
 logger.info("Rendering student workspace for parent '%s'.", (get_current_parent() or {}).get("username"))
 
 if st.session_state.get("exam_submitted"):
-    # Exam finished: show the result (show_result handles a missing result).
     show_result()
 elif "exam" in st.session_state:
     show_exam()

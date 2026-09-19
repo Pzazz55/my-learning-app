@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS email_queue (
 );
 
 -- Add student_id to exams table if it doesn't exist
-ALTER TABLE exams ADD COLUMN student_id INTEGER;
+ALTER TABLE exams ADD COLUMN student_id TEXT;
 ALTER TABLE exams ADD COLUMN parent_id INTEGER;
 
 -- Create indexes for better performance

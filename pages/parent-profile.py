@@ -207,10 +207,12 @@ with st.expander("➕ Add a child", expanded=False):
                 logger.exception("Failed to add child")
                 st.error(f"Could not add child: {error}")
 
-with st.expander("➖ Remove a child", expanded=False):
-    if len(students) <= 1:
-        st.info("You must keep at least one child on the account. Add another child before removing this one.")
-    else:
+if len(students) <= 1:
+    # Only one child: removing them is not allowed. Show the reason directly on
+    # the page (not inside a collapsed expander) so it is always visible.
+    st.info("You must keep at least one child on the account. Remove is unavailable while only one child is registered — add another child first if you need to remove this one.")
+else:
+    with st.expander("➖ Remove a child", expanded=False):
         remove_options = {f"{s['student_name']} ({s['student_id']})": s['student_id'] for s in students}
         remove_target = st.selectbox("Select the child to remove", options=list(remove_options.keys()), key="remove_child_target")
         confirm_remove = st.checkbox("I understand this permanently removes this child and their results.", key="confirm_remove_child")
